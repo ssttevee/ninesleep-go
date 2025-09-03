@@ -40,6 +40,7 @@ func main() {
 	gostName := flag.String("gost-name", "pod3", "Gosthome node name")
 	gostPoll := flag.Duration("gost-poll", 15*time.Second, "Polling interval for variables")
 	gostMDNS := flag.Bool("gost-mdns", true, "Enable mDNS advertisement")
+	webUI := flag.Bool("webui", false, "Enable web UI / HTTP server")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -75,26 +76,32 @@ func main() {
 		}
 	}()
 
-	srv := httpui.NewServer(pod)
-	httpSrv := &http.Server{
-		Addr:              *httpAddr,
-		Handler:           logRequestMiddleware(srv.Handler()),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	go func() {
-		log.Printf("[http] listening on %s (version=%s commit=%s date=%s)", httpSrv.Addr, version, commit, date)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("http server error: %v", err)
-			cancel()
+	var httpSrv *http.Server
+	if *webUI {
+		srv := httpui.NewServer(pod)
+		httpSrv = &http.Server{
+			Addr:              *httpAddr,
+			Handler:           logRequestMiddleware(srv.Handler()),
+			ReadHeaderTimeout: 5 * time.Second,
 		}
-	}()
+		go func() {
+			log.Printf("[http] listening on %s (version=%s commit=%s date=%s)", httpSrv.Addr, version, commit, date)
+			if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("http server error: %v", err)
+				cancel()
+			}
+		}()
+	} else {
+		log.Printf("[http] web UI disabled (enable with -webui)")
+	}
 
 	<-ctx.Done()
 	log.Println("shutting down...")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
+	if httpSrv != nil {
+		_ = httpSrv.Shutdown(shutdownCtx)
+	}
 	gm.Stop()
 	log.Println("exit.")
 }
