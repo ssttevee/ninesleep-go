@@ -4,8 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"net"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -112,11 +110,6 @@ func NewManager(pod *controller.PodController, opts ...Option) *Manager {
 	}
 	for _, o := range opts {
 		o(m)
-	}
-	if envPort := os.Getenv("GOSTHOME_API_PORT"); envPort != "" {
-		if v, err := strconv.Atoi(envPort); err == nil && v > 0 && v < 65536 {
-			m.apiPort = uint16(v)
-		}
 	}
 	return m
 }

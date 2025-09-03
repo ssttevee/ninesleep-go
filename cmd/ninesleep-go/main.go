@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -33,12 +34,26 @@ var (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
+	// CLI flags
+	httpAddr := flag.String("http", httpListenAddr, "HTTP listen address (host:port)")
+	gostPort := flag.Int("gost-port", 6053, "Gosthome API port")
+	gostName := flag.String("gost-name", "pod3", "Gosthome node name")
+	gostPoll := flag.Duration("gost-poll", 15*time.Second, "Polling interval for variables")
+	gostMDNS := flag.Bool("gost-mdns", true, "Enable mDNS advertisement")
+	flag.Parse()
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	pod := controller.New()
 
-	gm := gost.NewManager(pod)
+	gm := gost.NewManager(
+		pod,
+		gost.WithAPIPort(uint16(*gostPort)),
+		gost.WithName(*gostName),
+		gost.WithPollingInterval(*gostPoll),
+		gost.WithMDNS(*gostMDNS),
+	)
 	gm.Start(ctx)
 	if err := gm.InitError(); err != nil {
 		log.Printf("[gosthome] init error: %v", err)
@@ -62,7 +77,7 @@ func main() {
 
 	srv := httpui.NewServer(pod)
 	httpSrv := &http.Server{
-		Addr:              envOr("HTTP_LISTEN_ADDR", httpListenAddr),
+		Addr:              *httpAddr,
 		Handler:           logRequestMiddleware(srv.Handler()),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -120,13 +135,6 @@ func runUnixListener(ctx context.Context, pod *controller.PodController) error {
 		log.Printf("[unix] accepted connection")
 		pod.SetConnection(c)
 	}
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
 
 func logRequestMiddleware(next http.Handler) http.Handler {
