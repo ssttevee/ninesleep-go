@@ -139,6 +139,10 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		resp, err = s.pod.Execute(cmd, strconv.Itoa(val))
 	case "prime":
 		resp, err = s.pod.Execute(13, "")
+	case "raw":
+		cmdID, _ := strconv.Atoi(r.FormValue("cmd"))
+		payload := strings.TrimSpace(r.FormValue("payload"))
+		resp, err = s.pod.Execute(cmdID, payload)
 	default:
 		err = fmt.Errorf("unknown action %q", action)
 	}
@@ -264,6 +268,39 @@ pre.vars { background:#222; color:#9f9; padding:10px; border-radius:6px; overflo
       <input type="hidden" name="action" value="prime">
       <button type="submit">Prime (13)</button>
     </form>
+  </fieldset>
+
+  <fieldset>
+    <legend>Arbitrary Command</legend>
+    <form method="post" action="/action">
+      <input type="hidden" name="action" value="raw">
+      <label>Command ID:
+        <input type="number" name="cmd" min="0" required>
+      </label>
+      <label>Payload Hex (optional):
+        <input type="text" name="payload" placeholder="e.g. a1b203">
+      </label>
+      <button type="submit">Send Command</button>
+    </form>
+    <p><small>Payload (if provided) is sent as raw hex (no spaces). Leave empty for commands with no payload.</small></p>
+    </fieldset>
+
+  <fieldset>
+    <legend>Command Legend</legend>
+    <ul style="margin-top:0;">
+      <li><strong>0</strong>: Hello / ping</li>
+      <li><strong>5</strong>: Set alarm (left side)</li>
+      <li><strong>6</strong>: Set alarm (right side)</li>
+      <li><strong>8</strong>: Apply settings (LED brightness)</li>
+      <li><strong>9</strong>: Heat duration (left)</li>
+      <li><strong>10</strong>: Heat duration (right)</li>
+      <li><strong>11</strong>: Target heat level (left)</li>
+      <li><strong>12</strong>: Target heat level (right)</li>
+      <li><strong>13</strong>: Prime</li>
+      <li><strong>14</strong>: Variables snapshot</li>
+      <li><strong>16</strong>: Alarm clear</li>
+    </ul>
+    <p><small>Use the "Arbitrary Command" section above to send any command ID with an optional hex payload.</small></p>
   </fieldset>
 
   {{if .VarsJSON}}
