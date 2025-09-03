@@ -15,7 +15,6 @@ import (
 )
 
 const (
-	socketPath      = "/deviceinfo/dac.sock"
 	httpListenAddr  = "0.0.0.0:8080"
 	shutdownTimeout = 5 * time.Second
 )
@@ -35,12 +34,17 @@ func main() {
 	gostPoll := flag.Duration("gost-poll", 15*time.Second, "Polling interval for variables")
 	gostMDNS := flag.Bool("gost-mdns", true, "Enable mDNS advertisement")
 	webUI := flag.Bool("webui", false, "Enable web UI / HTTP server")
+	mitm := flag.Bool("mitm", false, "Enable MITM mode (ephemeral firmware <-> dac proxy)")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	pod := controller.New()
+	var opts []controller.Option
+	if *mitm {
+		opts = append(opts, controller.WithMITM(true))
+	}
+	pod := controller.New(opts...)
 
 	gm := gost.NewManager(
 		pod,
@@ -57,7 +61,7 @@ func main() {
 	}
 
 	go func() {
-		if err := pod.RunUnixSocketLoop(ctx, socketPath); err != nil {
+		if err := pod.RunUnixSocketLoop(ctx); err != nil {
 			log.Printf("unix socket loop exited: %v", err)
 			cancel()
 		}

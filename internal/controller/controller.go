@@ -1,14 +1,18 @@
 package controller
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"maps"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,8 +25,9 @@ import (
 const (
 	// DefaultSocketReadTimeout limits how long we wait for a single response read.
 	DefaultSocketReadTimeout = 50 * time.Millisecond
-	// DefaultMaxLogEntries bounds the in‑memory log buffer.
-	DefaultMaxLogEntries = 200
+
+	// DacSocketPath is the unix domain socket path used by the firmware and first‑party service.
+	DacSocketPath = "/deviceinfo/dac.sock"
 )
 
 // FrankenCommand mirrors the command nomenclature (utils.ts) from the original implementation.
@@ -134,15 +139,6 @@ type PodVariables struct {
 	Raw        string            `json:"raw"`
 }
 
-// LogEntry represents a single command interaction.
-type LogEntry struct {
-	Time       time.Time
-	Command    string
-	PayloadHex string
-	Response   string
-	Err        string
-}
-
 // VariablesCallback is invoked after parsing a variables response.
 type VariablesCallback func(pv *PodVariables)
 
@@ -154,15 +150,6 @@ func WithReadTimeout(d time.Duration) Option {
 	return func(p *PodController) { p.readTimeout = d }
 }
 
-// WithMaxLogEntries overrides the log buffer size.
-func WithMaxLogEntries(n int) Option {
-	return func(p *PodController) {
-		if n > 0 {
-			p.maxLogEntries = n
-		}
-	}
-}
-
 // WithVariablesCallback registers a callback invoked after each successful variables parse.
 func WithVariablesCallback(cb VariablesCallback) Option {
 	return func(p *PodController) {
@@ -172,14 +159,27 @@ func WithVariablesCallback(cb VariablesCallback) Option {
 	}
 }
 
+// WithMITM enables or disables man-in-the-middle mode.
+func WithMITM(enabled bool) Option {
+	return func(p *PodController) {
+		p.mitmMode = enabled
+	}
+}
+
 // PodController manages a single active pod connection and related state.
 type PodController struct {
 	mu sync.RWMutex
 
-	conn          net.Conn
-	connected     bool
-	logBuf        []*LogEntry
-	maxLogEntries int
+	conn      net.Conn
+	connected bool
+	mitmMode  bool
+
+	// reconnectCh is a length-1 buffered channel used to signal a transition
+	// from connected -> disconnected.
+	reconnectCh chan struct{}
+
+	// active (stored) unix listener for franken firmware
+	frankenLn net.Listener
 
 	// configuration
 	readTimeout  time.Duration
@@ -193,9 +193,7 @@ type PodController struct {
 // New creates a PodController with provided options.
 func New(opts ...Option) *PodController {
 	p := &PodController{
-		logBuf:        make([]*LogEntry, 0, DefaultMaxLogEntries),
-		readTimeout:   DefaultSocketReadTimeout,
-		maxLogEntries: DefaultMaxLogEntries,
+		readTimeout: DefaultSocketReadTimeout,
 	}
 	for _, o := range opts {
 		o(p)
@@ -203,8 +201,8 @@ func New(opts ...Option) *PodController {
 	return p
 }
 
-// SetConnection sets (and replaces) the active connection.
-func (p *PodController) SetConnection(c net.Conn) {
+// setConnection sets (and replaces) the active connection.
+func (p *PodController) setConnection(c net.Conn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.conn != nil {
@@ -212,22 +210,25 @@ func (p *PodController) SetConnection(c net.Conn) {
 	}
 	p.conn = c
 	p.connected = true
-	p.appendLogLocked(&LogEntry{
-		Time:    time.Now(),
-		Command: "connection",
-		Response: fmt.Sprintf("new connection from %s",
-			c.RemoteAddr().String()),
-	})
+	log.Printf("[controller] new connection from %s", c.RemoteAddr().String())
 }
 
-// WaitForFranken waits for an inbound connection on the provided listener, sets it,
+// waitForFranken waits for an inbound connection on the provided listener, sets it,
 // and returns the net.Conn (mirrors TS FrankenServer.waitForFranken).
-func (p *PodController) WaitForFranken(ln net.Listener) (net.Conn, error) {
-	conn, err := ln.Accept()
+func (p *PodController) waitForFranken() (net.Conn, error) {
+	p.mu.RLock()
+	connected := p.connected
+	conn := p.conn
+	p.mu.RUnlock()
+	if connected && conn != nil {
+		return conn, nil
+	}
+
+	conn, err := p.frankenLn.Accept()
 	if err != nil {
 		return nil, err
 	}
-	p.SetConnection(conn)
+	p.setConnection(conn)
 	return conn, nil
 }
 
@@ -238,50 +239,15 @@ func (p *PodController) ConnAlive() bool {
 	return p.connected && p.conn != nil
 }
 
-// LogSnapshot returns a copy of the recent log entries.
-func (p *PodController) LogSnapshot() []*LogEntry {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make([]*LogEntry, len(p.logBuf))
-	copy(out, p.logBuf)
-	return out
-}
-
 // ExecuteFranken issues a FrankenCommand with an optional hex payload.
 func (p *PodController) ExecuteFranken(cmd FrankenCommand, payloadHex string) (string, error) {
-	return p.Execute(cmd.CommandID(), payloadHex)
+	return p.ExecuteRaw(cmd.CommandID(), payloadHex)
 }
 
-// GetVariables sends PLEASE_SEND_VARIABLES and returns a raw key/value map.
-// Caching, structured parsing, and callbacks are performed inside Execute
-// when the variables command is issued.
-func (p *PodController) GetVariables() (map[string]string, error) {
-	resp, err := p.ExecuteFranken(FrankenCommandPleaseSendVariables, "")
-	if err != nil {
-		return nil, err
-	}
-	vars := map[string]string{}
-	lines := strings.Split(resp, "\n")
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l == "" {
-			continue
-		}
-		parts := strings.SplitN(l, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		k := strings.TrimSpace(parts[0])
-		v := strings.TrimSpace(parts[1])
-		vars[k] = v
-	}
-	return vars, nil
-}
-
-// Execute sends a raw command with optional hex payload and returns the response.
+// ExecuteRaw sends a raw command with optional hex payload and returns the response.
 // If the command is PLEASE_SEND_VARIABLES the variables are parsed, cached, and
 // callbacks are invoked (callbacks are executed after the lock is released).
-func (p *PodController) Execute(commandID int, payloadHex string) (string, error) {
+func (p *PodController) ExecuteRaw(commandID int, payloadHex string) (string, error) {
 	resp, parsed, callbacks, err := p.executeLocked(commandID, payloadHex)
 	if err != nil {
 		return "", err
@@ -310,7 +276,7 @@ func (p *PodController) ExecuteAlarm(a AlarmInput) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return p.Execute(cmdID, payloadHex)
+	return p.ExecuteRaw(cmdID, payloadHex)
 }
 
 // ExecuteSettings sends a settings command (currently LED brightness only).
@@ -322,7 +288,7 @@ func (p *PodController) ExecuteSettings(s SettingsInput) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return p.Execute(int(FrankenCommandSetSettings), payloadHex)
+	return p.ExecuteRaw(int(FrankenCommandSetSettings), payloadHex)
 }
 
 // ParsedVariables returns a deep copy of the last parsed variables (or nil).
@@ -335,25 +301,9 @@ func (p *PodController) ParsedVariables() *PodVariables {
 	cp := *p.lastParsed
 	if p.lastParsed.Unknown != nil {
 		cp.Unknown = make(map[string]string, len(p.lastParsed.Unknown))
-		for k, v := range p.lastParsed.Unknown {
-			cp.Unknown[k] = v
-		}
+		maps.Copy(cp.Unknown, p.lastParsed.Unknown)
 	}
 	return &cp
-}
-
-// appendLogLocked appends a log entry. Caller must hold write lock.
-func (p *PodController) appendLogLocked(le *LogEntry) {
-	if le == nil {
-		return
-	}
-	if le.Time.IsZero() {
-		le.Time = time.Now()
-	}
-	p.logBuf = append([]*LogEntry{le}, p.logBuf...)
-	if len(p.logBuf) > p.maxLogEntries {
-		p.logBuf = p.logBuf[:p.maxLogEntries]
-	}
 }
 
 // toCBORHex marshals a value to CBOR and hex-encodes it.
@@ -372,10 +322,7 @@ func (p *PodController) executeLocked(commandID int, payloadHex string) (string,
 	defer p.mu.Unlock()
 	if p.conn == nil {
 		err := errors.New("no active connection")
-		p.appendLogLocked(&LogEntry{
-			Command: strconv.Itoa(commandID),
-			Err:     err.Error(),
-		})
+		log.Printf("[controller] execute command=%d error=no active connection", commandID)
 		return "", nil, nil, err
 	}
 
@@ -388,11 +335,7 @@ func (p *PodController) executeLocked(commandID int, payloadHex string) (string,
 
 	_ = p.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if _, err := p.conn.Write(buf.Bytes()); err != nil {
-		p.appendLogLocked(&LogEntry{
-			Command:    strconv.Itoa(commandID),
-			PayloadHex: payloadHex,
-			Err:        "write failed: " + err.Error(),
-		})
+		log.Printf("[controller] write failed cmd=%d payload=%s err=%v", commandID, payloadHex, err)
 		return "", nil, nil, err
 	}
 
@@ -406,6 +349,10 @@ func (p *PodController) executeLocked(commandID int, payloadHex string) (string,
 		} else if errors.Is(rerr, io.EOF) {
 			resp = ""
 			p.connected = false
+			select {
+			case p.reconnectCh <- struct{}{}:
+			default:
+			}
 		} else {
 			resp = ""
 		}
@@ -413,12 +360,7 @@ func (p *PodController) executeLocked(commandID int, payloadHex string) (string,
 		resp = string(readBuf[:n])
 	}
 
-	p.appendLogLocked(&LogEntry{
-		Command:    strconv.Itoa(commandID),
-		PayloadHex: payloadHex,
-		Response:   resp,
-		Err:        errorString(rerr),
-	})
+	log.Printf("[controller] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(rerr))
 
 	if commandID == int(FrankenCommandPleaseSendVariables) {
 		parsed := parseVariables(resp)
@@ -437,8 +379,7 @@ func parseVariables(raw string) *PodVariables {
 		Unknown: map[string]string{},
 		Raw:     raw,
 	}
-	lines := strings.Split(raw, "\n")
-	for _, ln := range lines {
+	for ln := range strings.SplitSeq(raw, "\n") {
 		ln = strings.TrimSpace(ln)
 		if ln == "" {
 			continue
@@ -524,11 +465,11 @@ func errorString(err error) string {
 	return err.Error()
 }
 
-// TryCleanupUnixSocket removes a pre-existing unix domain socket file.
+// cleanupUnixSocket removes a pre-existing unix domain socket file.
 //
 // Mirrors the tryCleanup behavior in the original FrankenServer.start (TS) but is
 // exposed so callers can explicitly manage lifecycle when embedding the controller.
-func (p *PodController) CleanupUnixSocket(path string) error {
+func (p *PodController) cleanupUnixSocket(path string) error {
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -538,47 +479,58 @@ func (p *PodController) CleanupUnixSocket(path string) error {
 	return nil
 }
 
-// StartFrankenUnixSocket creates and starts a unix domain socket listener used to
-// accept Franken (firmware) connections. This is analogous to FrankenServer.start
-// in the TypeScript reference. The caller is responsible for closing the returned
-// listener. If the underlying *net.UnixListener is obtained, SetUnlinkOnClose(true)
-// is invoked to ensure cleanup on close.
+// startUnixSocket creates (or recreates) the primary unix domain socket listener at DacSocketPath
+// and stores it in the controller. If a previous stored listener exists it is closed first.
+// The stored listener is used by RunUnixSocketLoop unless overridden during MITM injection.
 //
-// Typical usage:
+// Concurrency:
+//   - Caller should NOT hold p.mu; this function acquires it internally only after
+//     the listener is successfully created.
+//   - Safe to call repeatedly; an existing different listener will be closed.
 //
-//	if err := TryCleanupUnixSocket(sockPath); err != nil { ... }
-//	ln, err := StartFrankenUnixSocket(sockPath)
-//	conn, err := controller.WaitForFranken(ln)
-func (p *PodController) StartUnixSocket(path string) (net.Listener, error) {
-	if err := p.CleanupUnixSocket(path); err != nil {
-		return nil, fmt.Errorf("cleanup socket: %w", err)
+// Idempotency:
+//   - If the existing listener already listens on DacSocketPath it is replaced
+//     without error (the old one is closed).
+func (p *PodController) startUnixSocket() error {
+	if err := p.cleanupUnixSocket(DacSocketPath); err != nil {
+		return fmt.Errorf("cleanup socket: %w", err)
 	}
-	l, err := net.Listen("unix", path)
+	l, err := net.Listen("unix", DacSocketPath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if ul, ok := l.(*net.UnixListener); ok {
 		ul.SetUnlinkOnClose(true)
 	}
-	return l, nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.frankenLn != nil && p.frankenLn != l {
+		_ = p.frankenLn.Close()
+	}
+	p.frankenLn = l
+	return nil
 }
 
-// RunUnixSocketLoop ensures the directory for the socket exists, starts (or
-// reuses) a unix socket listener and continuously waits for incoming firmware
-// (franken) connections until the context is canceled. Each accepted
-// connection is set as the active connection. Returns when context is done
-// or when a non‑context related accept error occurs.
-func (p *PodController) RunUnixSocketLoop(ctx context.Context, sockPath string) error {
-	dir := filepath.Dir(sockPath)
+// stopUnixSocket closes the currently stored unix listener (if present) and
+// clears the reference so a later startUnixSocket or InjectMITM can recreate it.
+func (p *PodController) stopUnixSocket() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.frankenLn == nil {
+		return nil
+	}
+	err := p.frankenLn.Close()
+	p.frankenLn = nil
+	return err
+}
+
+// RunUnixSocketLoop ensures a unix socket listener exists and continuously
+// accepts firmware connections until the context is canceled.
+func (p *PodController) RunUnixSocketLoop(ctx context.Context) error {
+	dir := filepath.Dir(DacSocketPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
-
-	ln, err := p.StartUnixSocket(sockPath)
-	if err != nil {
-		return err
-	}
-	defer ln.Close()
 
 	for {
 		select {
@@ -587,13 +539,209 @@ func (p *PodController) RunUnixSocketLoop(ctx context.Context, sockPath string) 
 		default:
 		}
 
-		_, err := p.WaitForFranken(ln)
+		// If a connection is already active, wait efficiently for it to end.
+		if p.ConnAlive() {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-p.reconnectCh:
+			}
+			continue
+		}
+
+		if p.mitmMode {
+			if err := p.reconnectFrankenMitm(ctx); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+
+				return err
+			}
+
+		} else {
+			if err := p.reconnectFrankenNormal(true); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+
+				return err
+			}
+		}
+	}
+}
+
+func (p *PodController) reconnectFrankenNormal(reuse bool) error {
+	p.mu.RLock()
+	ln := p.frankenLn
+	p.mu.RUnlock()
+
+	if ln == nil || !reuse {
+		if err := p.startUnixSocket(); err != nil {
+			return fmt.Errorf("start unix socket: %w", err)
+		}
+	}
+
+	// Accept firmware connection.
+	if _, err := p.waitForFranken(); err != nil {
+		return fmt.Errorf("wait for franken: %w", err)
+	}
+
+	return nil
+}
+
+// mitmConnectAndForward connects to the original (renamed) dac socket and
+// forwards commands bi‑directionally between the first‑party process and the
+// active firmware connection managed by this controller.
+func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
+	upConn, err := net.Dial("unix", DacSocketPath)
+	if err != nil {
+		return fmt.Errorf("dial upstream: %w", err)
+	}
+	defer upConn.Close()
+
+	reader := bufio.NewReader(upConn)
+
+	for {
+		// Honor context cancellation.
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		_ = upConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		cmdLine, err := reader.ReadString('\n')
 		if err != nil {
-			// If context canceled, treat as graceful exit.
-			if ctx.Err() != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			return err
+			return fmt.Errorf("read command line: %w", err)
+		}
+		cmdLine = strings.TrimSpace(cmdLine)
+		if cmdLine == "" {
+			// Skip stray blank lines.
+			continue
+		}
+		commandID, err := strconv.Atoi(cmdLine)
+		if err != nil {
+			// Malformed line; log and continue.
+			log.Printf("[mitm] invalid command id line=%q", cmdLine)
+			continue
+		}
+
+		_ = upConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		payloadLine, err := reader.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("read payload line: %w", err)
+		}
+		payloadLineTrimmed := strings.TrimSpace(payloadLine)
+
+		payloadHex := ""
+		if payloadLineTrimmed != "" {
+			payloadHex = payloadLineTrimmed
+			// Consume the required terminating blank line if present (ignore errors/timeouts).
+			_ = upConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			if term, terr := reader.ReadString('\n'); terr == nil {
+				_ = term
+			}
+		} else {
+			// payloadLine itself was the blank terminator for no-payload command;
+			// nothing more to consume.
+		}
+
+		resp, execErr := p.ExecuteRaw(commandID, payloadHex)
+
+		// Write response back (best effort).
+		_ = upConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if resp == "" {
+			// Maintain protocol expectation of something being sent; at least a newline.
+			_, _ = upConn.Write([]byte("\n"))
+		} else {
+			_, _ = upConn.Write([]byte(resp))
+		}
+
+		// Log the MITM interaction.
+		log.Printf("[mitm] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(execErr))
+	}
+}
+
+// reconnectFrankenMitm performs ephemeral MITM setup. After completion the controller
+// proxies commands between the firmware (captured via a temporary intercept socket) and
+// the first‑party process which continues to own dac.sock. We do NOT keep dac.sock bound;
+// if this process exits the system keeps working normally.
+//
+// Ephemeral flow (crash‑safe):
+//  1. systemctl stop dac
+//  2. Create a temporary intercept socket and accept a firmware (franken) connection
+//  3. Close (unbind) the temporary intercept socket so dac can recreate dac.sock
+//  4. systemctl start dac
+//  5. Once dac.sock is recreated, begin MITM forwarding (background goroutine)
+//
+// Re‑injection:
+//   - If the firmware disconnects, this can be invoked again.
+//   - Because dac.sock is not held long‑term, crashes revert cleanly to native behavior.
+//
+// Returns after initial setup; forwarding continues in a background goroutine.
+func (p *PodController) reconnectFrankenMitm(ctx context.Context) error {
+	logStep := func(step, msg string, err error) {
+		if err != nil {
+			log.Printf("[mitm-inject] step=%s msg=%s err=%s", step, msg, errorString(err))
+		} else {
+			log.Printf("[mitm-inject] step=%s %s", step, msg)
+		}
+	}
+
+	// Step 1: stop dac service.
+	if err := exec.Command("systemctl", "stop", "dac").Run(); err != nil {
+		logStep("stop", "systemctl stop dac", err)
+		return fmt.Errorf("stop dac: %w", err)
+	}
+	logStep("stop", "dac stopped", nil)
+
+	// Step 2: start temporary intercept socket to capture firmware connection.
+	if err := p.reconnectFrankenNormal(false); err != nil {
+		logStep("start-listener-initial", "start intercept socket", err)
+		return fmt.Errorf("start initial socket: %w", err)
+	}
+	logStep("start-listener-initial", "intercept listener started", nil)
+
+	// Step 3: unbind (close) our temporary listener (SetUnlinkOnClose will remove the path).
+	if err := p.stopUnixSocket(); err != nil {
+		logStep("unbind-initial", "close initial listener", err)
+		return fmt.Errorf("close initial listener: %w", err)
+	}
+	logStep("unbind-initial", "initial listener closed", nil)
+
+	// Step 4: restart dac service so it recreates dac.sock.
+	if err := exec.Command("systemctl", "start", "dac").Run(); err != nil {
+		logStep("start-dac", "systemctl start dac", err)
+		return fmt.Errorf("start dac: %w", err)
+	}
+	logStep("start-dac", "dac started", nil)
+
+	// Step 5: start forwarding loop (connect to dac.sock as a client) in background.
+	go p.runMitmLoop(ctx)
+
+	logStep("complete", "MITM injection complete", nil)
+	return nil
+}
+
+func (p *PodController) runMitmLoop(ctx context.Context) {
+	for {
+		if err := p.mitmConnectAndForward(ctx); err != nil {
+			if ctx.Err() != nil {
+				log.Printf("[mitm-loop] context canceled, stopping")
+				return
+			}
+
+			log.Printf("[mitm-loop] error: %v", err)
+			time.Sleep(5 * time.Second)
 		}
 	}
 }

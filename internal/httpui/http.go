@@ -35,13 +35,11 @@ func (s *Server) Handler() http.Handler { return s.mux }
 func (s *Server) routes() {
 	s.mux.HandleFunc("/", s.handleUI)
 	s.mux.HandleFunc("/action", s.handleAction)
-	s.mux.HandleFunc("/logs.json", s.handleLogsJSON)
 	s.mux.HandleFunc("/variables.json", s.handleVarsJSON)
 }
 
 type uiData struct {
 	Connected bool
-	Logs      []*controller.LogEntry
 	NowUnix   int64
 	VarsJSON  string
 }
@@ -56,7 +54,6 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 	}
 	data := uiData{
 		Connected: s.pod.ConnAlive(),
-		Logs:      s.pod.LogSnapshot(),
 		NowUnix:   time.Now().Unix(),
 		VarsJSON:  varsJSON,
 	}
@@ -64,13 +61,6 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 	if err := s.tmpl.Execute(w, data); err != nil {
 		http.Error(w, err.Error(), 500)
 	}
-}
-
-func (s *Server) handleLogsJSON(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(s.pod.LogSnapshot())
 }
 
 func (s *Server) handleVarsJSON(w http.ResponseWriter, r *http.Request) {
@@ -115,7 +105,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			Side: side, PL: pl, DU: du, TT: tt, Pattern: pattern,
 		})
 	case "alarm-clear":
-		resp, err = s.pod.Execute(16, "")
+		resp, err = s.pod.ExecuteRaw(16, "")
 	case "settings":
 		lb, _ := strconv.Atoi(r.FormValue("lb"))
 		resp, err = s.pod.ExecuteSettings(controller.SettingsInput{LB: lb})
@@ -148,7 +138,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "raw":
 		cmdID, _ := strconv.Atoi(r.FormValue("cmd"))
 		payload := strings.TrimSpace(r.FormValue("payload"))
-		resp, err = s.pod.Execute(cmdID, payload)
+		resp, err = s.pod.ExecuteRaw(cmdID, payload)
 	default:
 		err = fmt.Errorf("unknown action %q", action)
 	}
@@ -175,8 +165,6 @@ input[type=number], input[type=text] { width: 7em; }
   background:#eee; font-weight:bold; }
 .status.ok { background:#c8f7c5; }
 .status.no { background:#f9d0d0; }
-.logs { font-family: monospace; white-space: pre-wrap; background:#111; color:#ddd; padding:10px; border-radius:6px; max-height:400px; overflow:auto; }
-.log-entry { margin-bottom: 0.8em; border-bottom:1px solid #333; padding-bottom:0.4em; }
 small { color:#888; }
 form.inline { display:inline; }
 code { background:#f4f4f4; padding:1px 3px; border-radius:3px; }
@@ -318,20 +306,7 @@ pre.vars { background:#222; color:#9f9; padding:10px; border-radius:6px; overflo
   {{end}}
 </section>
 
-<h2>Recent Log</h2>
-<div class="logs">
-  {{range .Logs}}
-    <div class="log-entry">
-      <div><strong>{{.Time.Format "15:04:05.000"}}</strong> cmd=<code>{{.Command}}</code>
-      {{if .PayloadHex}} payload=<code>{{.PayloadHex}}</code>{{end}}</div>
-      {{if .Err}}<div style="color:#ff8080;">err: {{.Err}}</div>{{end}}
-      {{if .Response}}<div style="color:#9cdcfe; white-space:pre-wrap;">{{trim .Response}}</div>{{end}}
-    </div>
-  {{end}}
-  {{if not .Logs}}<em>No log entries yet.</em>{{end}}
-</div>
-
-<p><small>Endpoints: <code>/logs.json</code>, <code>/variables.json</code>. Refresh page to update UI.</small></p>
+<p><small>Endpoint: <code>/variables.json</code>. Refresh page to update UI.</small></p>
 
 </body>
 </html>

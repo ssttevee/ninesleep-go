@@ -257,7 +257,7 @@ func (m *Manager) pollOnce() {
 	if m.pod == nil {
 		return
 	}
-	_, err := m.pod.Execute(m.varsCommand, "")
+	_, err := m.pod.ExecuteRaw(m.varsCommand, "")
 	now := time.Now()
 	if err != nil {
 		// heartbeat sensor still updated
