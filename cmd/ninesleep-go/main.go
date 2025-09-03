@@ -29,9 +29,12 @@ import (
 	_ "github.com/gosthome/gosthome/components" // register default components (api, sensor, textsensor, etc.)
 	"github.com/gosthome/gosthome/components/api"
 	"github.com/gosthome/gosthome/core"
+	"github.com/gosthome/gosthome/core/bus"
 	"github.com/gosthome/gosthome/core/component"
 	"github.com/gosthome/gosthome/core/config"
+	"github.com/gosthome/gosthome/core/entity"
 	"github.com/gosthome/gosthome/core/registry"
+	"github.com/gosthome/gosthome/core/state"
 )
 
 /*
@@ -562,27 +565,11 @@ func runUnixListener(ctx context.Context, pod *podController) error {
 	}
 }
 
-// ---- Gosthome Integration (scaffolding) ----
+// ---- Gosthome Integration (dynamic entities) ----
 //
-// NOTE: This is a minimal, non-intrusive integration scaffold that
-// initializes a gosthome node (ESPHome Native API server) IF the
-// environment variable GOSTHOME_ENABLE=1 is set. For now it only
-// prepares the framework to publish parsed variables; the actual
-// sensor entity registration & state updates are left as TODOs
-// because implementing custom dynamic sensors without modifying
-// gosthome requires more extensive inspection of its registry
-// APIs. This keeps the current file self-contained and avoids
-// altering upstream gosthome code.
-//
-// User steps to experiment:
-//   export GOSTHOME_ENABLE=1
-//   export GOSTHOME_API_PORT=6053   (optional; default 6053)
-//   go run ./cmd/ninesleep-go
-//
-// Then add the device to Home Assistant via ESPHome Native API.
-//
-// Once we finalize dynamic sensor registration strategy, we will
-// replace the TODOs below with real entity creation & updates.
+// This section now unconditionally initializes a gosthome (ESPHome native API)
+// node and dynamically registers sensors/text sensors/binary sensors that
+// reflect parsed Pod variables plus a heartbeat & availability indicator.
 
 var (
 	gosthomeOnce       sync.Once
@@ -590,37 +577,56 @@ var (
 	gosthomeInitErr    error
 	gosthomeCtxCancel  context.CancelFunc
 	gosthomeSensorLock sync.Mutex
+
+	// base context used for creating dynamic gosthome entity states (must carry bus)
+	gosthomeBaseCtx context.Context
+	lastPollSuccess time.Time
 )
+
+func gosthomeCtx() context.Context {
+	// Returns a non-nil context for creating dynamic entity states.
+	// Falls back to Background() if gosthome not fully initialized yet.
+	if gosthomeBaseCtx != nil {
+		return gosthomeBaseCtx
+	}
+	return context.Background()
+}
 
 // updateGosthomeFromParsed is currently a placeholder that just logs.
 // Later it will push each parsed field into a corresponding gosthome sensor.
 func updateGosthomeFromParsed(pv *podVariables) {
-	if pv == nil {
+	if pv == nil || gosthomeNode == nil {
 		return
 	}
-	if gosthomeNode == nil {
-		return
-	}
-	// Placeholder logging
-	slog.Debug("gosthome placeholder update (no sensors yet)",
-		"tgHeatLevelL", pv.TgHeatLevelL,
-		"tgHeatLevelR", pv.TgHeatLevelR,
-		"heatLevelL", pv.HeatLevelL,
-		"heatLevelR", pv.HeatLevelR,
-		"heatTimeL", pv.HeatTimeL,
-		"heatTimeR", pv.HeatTimeR,
-		"waterLevel", pv.WaterLevel,
-		"priming", pv.Priming,
-		"sensorLabel", pv.SensorLabel,
-	)
-	// TODO: Register (once) a set of sensor + text sensor entities and update their state here.
+
+	ensureGosthomeEntities()
+
+	// Numeric sensors
+	setFloatSensor("tg_heat_level_left", float32(pv.TgHeatLevelL), "lvl")
+	setFloatSensor("tg_heat_level_right", float32(pv.TgHeatLevelR), "lvl")
+	setFloatSensor("heat_level_left", float32(pv.HeatLevelL), "lvl")
+	setFloatSensor("heat_level_right", float32(pv.HeatLevelR), "lvl")
+	setFloatSensor("heat_time_left_seconds", float32(pv.HeatTimeL), "s")
+	setFloatSensor("heat_time_right_seconds", float32(pv.HeatTimeR), "s")
+
+	// Binary sensors (represented as float 0/1 if binary domain not yet wired)
+	setBinarySensor("water_level_ok", pv.WaterLevel)
+	setBinarySensor("priming_active", pv.Priming)
+
+	// Text sensors
+	setTextSensor("sensor_label", pv.SensorLabel)
+	setTextSensor("settings_raw", pv.SettingsRaw)
+
+	// Heartbeat (epoch seconds) - updated here as well (fast path)
+	setFloatSensor("pod_heartbeat_epoch", float32(time.Now().Unix()), "s")
 }
 
 // initGosthome initializes a gosthome node with only the API component active.
-func initGosthome(parent context.Context) {
+func initGosthome(parent context.Context, pod *podController) {
 	gosthomeOnce.Do(func() {
 		ctx, cancel := context.WithCancel(parent)
 		gosthomeCtxCancel = cancel
+		// Do not set gosthomeBaseCtx yet; bus not attached until node is constructed
 
 		// Build minimal config programmatically
 		apiPort := uint16(6053)
@@ -657,6 +663,23 @@ func initGosthome(parent context.Context) {
 			return
 		}
 		gosthomeNode = node
+
+		// Manually create required domains if not present.
+		for _, d := range []entity.DomainDefinition{
+			entity.PublicDomain(&entity.SensorDomain{}),
+			entity.PublicDomain(&entity.BinarySensorDomain{}),
+			entity.PublicDomain(&entity.TextSensorDomain{}),
+		} {
+			if err := gosthomeNode.Registry.CreateDomain(d); err != nil {
+				// Ignore duplicate registration; only log if it is not that case.
+				if _, ok := err.(entity.ErrAlreadyRegistered); !ok {
+					slog.Warn("Failed to create domain", "err", err)
+				}
+			}
+		}
+
+		// Attach bus to a base context for dynamic state objects
+		gosthomeBaseCtx = bus.Context(context.Background(), gosthomeNode.Bus)
 		go node.Start()
 		slog.Info("Gosthome (ESPHome API) started",
 			"port", apiPort,
@@ -690,12 +713,252 @@ func initGosthome(parent context.Context) {
 			slog.Info("mDNS advertisement stopped")
 		}()
 
-		// TODO: Dynamically register sensor + text sensor entities here:
-		// Example concept (pseudo):
-		// createNumberSensor("heat_level_left", "Heat Level Left", "°C")
-		// createTextSensor("sensor_label", "Sensor Label")
-		// We need to ensure we use gosthome's entity registration APIs safely post-start.
+		// Start polling loop (variables command 14) with diff-based updates
+		go pollingLoop(ctx, pod)
 	})
+}
+
+// ---------- Dynamic gosthome entities & polling ----------
+
+type floatSensor struct {
+	ent  *entity.BaseEntity
+	st   state.State_[entity.SensorState]
+	unit string
+}
+
+// component.Component methods
+func (f *floatSensor) Setup()       {}
+func (f *floatSensor) Close() error { return nil }
+func (f *floatSensor) InitializationPriority() component.InitializationPriority {
+	return component.InitializationPriorityBus
+}
+
+func (f *floatSensor) AccuracyDecimals() int32             { return 2 }
+func (f *floatSensor) ForceUpdate() bool                   { return false }
+func (f *floatSensor) StateClass() entity.SensorStateClass { return entity.SensorStateClassMeasurement }
+func (f *floatSensor) LastResetType() entity.SensorLastResetType {
+	return entity.SensorLastResetTypeNone
+}
+func (f *floatSensor) UnitOfMeasurement() string             { return f.unit }
+func (f *floatSensor) DeviceClass() entity.SensorDeviceClass { return "" }
+func (f *floatSensor) Icon() string                          { return "" }
+func (f *floatSensor) State() entity.SensorState             { return f.st.State() }
+func (f *floatSensor) ID() string                            { return f.ent.ID() }
+func (f *floatSensor) HashID() uint32                        { return f.ent.HashID() }
+func (f *floatSensor) Name() string                          { return f.ent.Name() }
+func (f *floatSensor) Internal() bool                        { return f.ent.Internal() }
+func (f *floatSensor) DisabledByDefault() bool               { return f.ent.DisabledByDefault() }
+func (f *floatSensor) EntityCategory() entity.Category       { return f.ent.EntityCategory() }
+
+type binSensor struct {
+	ent *entity.BaseEntity
+	st  state.State_[entity.BinarySensorState]
+}
+
+// component.Component methods
+func (b *binSensor) Setup()       {}
+func (b *binSensor) Close() error { return nil }
+func (b *binSensor) InitializationPriority() component.InitializationPriority {
+	return component.InitializationPriorityBus
+}
+
+func (b *binSensor) IsStatusBinarySensor() bool                  { return false }
+func (b *binSensor) DeviceClass() entity.BinarySensorDeviceClass { return "" }
+func (b *binSensor) Icon() string                                { return "" }
+func (b *binSensor) State() entity.BinarySensorState             { return b.st.State() }
+func (b *binSensor) ID() string                                  { return b.ent.ID() }
+func (b *binSensor) HashID() uint32                              { return b.ent.HashID() }
+func (b *binSensor) Name() string                                { return b.ent.Name() }
+func (b *binSensor) Internal() bool                              { return b.ent.Internal() }
+func (b *binSensor) DisabledByDefault() bool                     { return b.ent.DisabledByDefault() }
+func (b *binSensor) EntityCategory() entity.Category             { return b.ent.EntityCategory() }
+
+type textSensor struct {
+	ent *entity.BaseEntity
+	st  state.State_[entity.TextSensorState]
+}
+
+// component.Component methods
+func (t *textSensor) Setup()       {}
+func (t *textSensor) Close() error { return nil }
+func (t *textSensor) InitializationPriority() component.InitializationPriority {
+	return component.InitializationPriorityBus
+}
+
+func (t *textSensor) DeviceClass() entity.SensorDeviceClass { return "" }
+func (t *textSensor) Icon() string                          { return "" }
+func (t *textSensor) State() entity.TextSensorState         { return t.st.State() }
+func (t *textSensor) ID() string                            { return t.ent.ID() }
+func (t *textSensor) HashID() uint32                        { return t.ent.HashID() }
+func (t *textSensor) Name() string                          { return t.ent.Name() }
+func (t *textSensor) Internal() bool                        { return t.ent.Internal() }
+func (t *textSensor) DisabledByDefault() bool               { return t.ent.DisabledByDefault() }
+func (t *textSensor) EntityCategory() entity.Category       { return t.ent.EntityCategory() }
+
+var (
+	ghEntitiesOnce sync.Once
+	floatSensors   = map[string]*floatSensor{}
+	binarySensors  = map[string]*binSensor{}
+	textSensors    = map[string]*textSensor{}
+	sensorMu       sync.Mutex
+)
+
+func ensureGosthomeEntities() {
+	ghEntitiesOnce.Do(func() {
+		if gosthomeNode == nil {
+			return
+		}
+	})
+}
+
+func setFloatSensor(id string, val float32, unit string) {
+	if gosthomeNode == nil {
+		return
+	}
+	sensorMu.Lock()
+	defer sensorMu.Unlock()
+	fs, ok := floatSensors[id]
+	if !ok {
+		fs = newFloatSensor(id, unit)
+		if err := gosthomeNode.Registry.RegisterSensor(fs); err != nil {
+			slog.Error("register sensor failed", "id", id, "err", err)
+			return
+		}
+		floatSensors[id] = fs
+	}
+	cur := fs.State()
+	if cur.State != val || cur.MissingState {
+		cur.State = val
+		cur.MissingState = false
+		fs.st.SetState(cur)
+	}
+}
+
+func newFloatSensor(id, unit string) *floatSensor {
+	cfg := &entity.EntityConfig{
+		ID:   id,
+		Name: prettyName(id),
+	}
+	beVal := entity.NewBaseEntity(entity.DomainTypeSensor, cfg)
+	be := &beVal
+	st, _ := state.NewState(gosthomeCtx(), be, entity.SensorState{State: 0, MissingState: true})
+	return &floatSensor{ent: be, st: st, unit: unit}
+}
+
+func setBinarySensor(id string, on bool) {
+	if gosthomeNode == nil {
+		return
+	}
+	sensorMu.Lock()
+	defer sensorMu.Unlock()
+	bs, ok := binarySensors[id]
+	if !ok {
+		bs = newBinarySensor(id)
+		if err := gosthomeNode.Registry.RegisterBinarySensor(bs); err != nil {
+			slog.Error("register binary sensor failed", "id", id, "err", err)
+			return
+		}
+		binarySensors[id] = bs
+	}
+	cur := bs.State()
+	if cur.State != on || cur.Missing {
+		cur.State = on
+		cur.Missing = false
+		bs.st.SetState(cur)
+	}
+}
+
+func newBinarySensor(id string) *binSensor {
+	cfg := &entity.EntityConfig{
+		ID:   id,
+		Name: prettyName(id),
+	}
+	beVal := entity.NewBaseEntity(entity.DomainTypeBinarySensor, cfg)
+	be := &beVal
+	st, _ := state.NewState(gosthomeCtx(), be, entity.BinarySensorState{State: false, Missing: true})
+	return &binSensor{ent: be, st: st}
+}
+
+func setTextSensor(id, val string) {
+	if gosthomeNode == nil {
+		return
+	}
+	sensorMu.Lock()
+	defer sensorMu.Unlock()
+	ts, ok := textSensors[id]
+	if !ok {
+		ts = newTextSensor(id)
+		if err := gosthomeNode.Registry.RegisterTextSensor(ts); err != nil {
+			slog.Error("register text sensor failed", "id", id, "err", err)
+			return
+		}
+		textSensors[id] = ts
+	}
+	cur := ts.State()
+	if cur.State != val || cur.MissingState {
+		cur.State = val
+		cur.MissingState = false
+		ts.st.SetState(cur)
+	}
+}
+
+func newTextSensor(id string) *textSensor {
+	cfg := &entity.EntityConfig{
+		ID:   id,
+		Name: prettyName(id),
+	}
+	beVal := entity.NewBaseEntity(entity.DomainTypeTextSensor, cfg)
+	be := &beVal
+	st, _ := state.NewState(gosthomeCtx(), be, entity.TextSensorState{State: "", MissingState: true})
+	return &textSensor{ent: be, st: st}
+}
+
+func updateAvailability() {
+	// Consider pod available if last successful poll was within 2*interval + small grace
+	grace := 5 * time.Second
+	ok := false
+	if !lastPollSuccess.IsZero() {
+		ok = time.Since(lastPollSuccess) <= 2*pollInterval+grace
+	}
+	setBinarySensor("pod_available", ok)
+}
+
+func prettyName(id string) string {
+	parts := strings.Split(id, "_")
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(p[:1]) + p[1:]
+	}
+	return strings.Join(parts, " ")
+}
+
+const pollInterval = 15 * time.Second
+
+func pollingLoop(ctx context.Context, pod *podController) {
+	t := time.NewTicker(pollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			// Always request variables to keep time-based changes visible.
+			_, err := pod.execute(14, "")
+			now := time.Now()
+			if err != nil {
+				// Failure path: still bump heartbeat, update availability (likely false)
+				setFloatSensor("pod_heartbeat_epoch", float32(now.Unix()), "s")
+				updateAvailability()
+				continue
+			}
+			// Success
+			lastPollSuccess = now
+			updateAvailability()
+			// pod.execute already parsed & called updateGosthomeFromParsed (which set heartbeat)
+		}
+	}
 }
 
 // ---- Main ----
@@ -710,7 +973,7 @@ func main() {
 
 	// Optionally start gosthome (ESPHome native API server) for HA integration
 	// Always enable gosthome integration (env gating removed)
-	initGosthome(ctx)
+	initGosthome(ctx, pod)
 	if gosthomeInitErr != nil {
 		log.Printf("[gosthome] initialization error: %v", gosthomeInitErr)
 	} else {
