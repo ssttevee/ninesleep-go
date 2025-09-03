@@ -38,16 +38,16 @@ type SettingsInput struct {
 
 // PodVariables is a structured representation of the variables response.
 type PodVariables struct {
-	TgHeatLevelR int    `json:"tgHeatLevelR"`
-	TgHeatLevelL int    `json:"tgHeatLevelL"`
-	HeatTimeL    int    `json:"heatTimeL"`
-	HeatLevelL   int    `json:"heatLevelL"`
-	HeatTimeR    int    `json:"heatTimeR"`
-	HeatLevelR   int    `json:"heatLevelR"`
-	SensorLabel  string `json:"sensorLabel"`
-	WaterLevel   bool   `json:"waterLevel"`
-	Priming      bool   `json:"priming"`
-	SettingsRaw  string `json:"settingsRaw"`
+	TargetHeatLevelR int    `json:"targetHeatLevelR"`
+	TargetHeatLevelL int    `json:"targetHeatLevelL"`
+	HeatTimeL        int    `json:"heatTimeL"`
+	HeatLevelL       int    `json:"heatLevelL"`
+	HeatTimeR        int    `json:"heatTimeR"`
+	HeatLevelR       int    `json:"heatLevelR"`
+	SensorLabel      string `json:"sensorLabel"`
+	WaterLevel       bool   `json:"waterLevel"`
+	Priming          bool   `json:"priming"`
+	SettingsRaw      string `json:"settingsRaw"`
 
 	Unknown    map[string]string `json:"unknown,omitempty"`
 	ParseError string            `json:"parseError,omitempty"`
@@ -348,13 +348,13 @@ func defaultVariablesParser(raw string) *PodVariables {
 		switch key {
 		case "tgHeatLevelR":
 			if i, e := parseInt(val); e == nil {
-				pv.TgHeatLevelR = i
+				pv.TargetHeatLevelR = i
 			} else {
 				pv.ParseError += "tgHeatLevelR:" + e.Error() + ";"
 			}
 		case "tgHeatLevelL":
 			if i, e := parseInt(val); e == nil {
-				pv.TgHeatLevelL = i
+				pv.TargetHeatLevelL = i
 			} else {
 				pv.ParseError += "tgHeatLevelL:" + e.Error() + ";"
 			}

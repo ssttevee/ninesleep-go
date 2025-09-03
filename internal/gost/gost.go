@@ -46,9 +46,10 @@ type Manager struct {
 	lastPollSuccess time.Time
 
 	// entity maps
-	floatSensors  map[string]*floatSensor
-	binarySensors map[string]*binSensor
-	textSensors   map[string]*textSensor
+	floatSensors      map[string]*floatSensor
+	binarySensors     map[string]*binSensor
+	textSensors       map[string]*textSensor
+	disabledByDefault map[string]struct{}
 }
 
 // Option configures a Manager.
@@ -95,18 +96,36 @@ func WithVariablesCommand(id int) Option {
 	}
 }
 
+// WithDisabledSensors marks specified sensor IDs to be disabled by default
+// when first registered (Home Assistant will show them as entities that must
+// be manually enabled).
+func WithDisabledSensors(ids ...string) Option {
+	return func(m *Manager) {
+		if m.disabledByDefault == nil {
+			m.disabledByDefault = map[string]struct{}{}
+		}
+		for _, id := range ids {
+			if id == "" {
+				continue
+			}
+			m.disabledByDefault[id] = struct{}{}
+		}
+	}
+}
+
 // NewManager creates a Manager; call Start to initialize the node.
 func NewManager(pod *controller.PodController, opts ...Option) *Manager {
 	m := &Manager{
-		pod:           pod,
-		name:          "pod3",
-		apiPort:       6053,
-		pollEvery:     15 * time.Second,
-		enableMDNS:    true,
-		varsCommand:   14,
-		floatSensors:  map[string]*floatSensor{},
-		binarySensors: map[string]*binSensor{},
-		textSensors:   map[string]*textSensor{},
+		pod:               pod,
+		name:              "pod3",
+		apiPort:           6053,
+		pollEvery:         15 * time.Second,
+		enableMDNS:        true,
+		varsCommand:       14,
+		floatSensors:      map[string]*floatSensor{},
+		binarySensors:     map[string]*binSensor{},
+		textSensors:       map[string]*textSensor{},
+		disabledByDefault: map[string]struct{}{},
 	}
 	for _, o := range opts {
 		o(m)
@@ -197,6 +216,8 @@ func (m *Manager) initNode(ctx context.Context) {
 
 	go node.Start()
 	slog.Info("gosthome API started", "name", m.name, "port", m.apiPort)
+	// Pre-register known sensors (some disabled by default)
+	m.preRegisterEntities()
 
 	if m.enableMDNS {
 		go m.runMDNS(ctx, apiCfg)
@@ -255,8 +276,8 @@ func (m *Manager) updateFromParsed() {
 		return
 	}
 	// Numeric
-	m.setFloat("tg_heat_level_left", float32(pv.TgHeatLevelL), "lvl")
-	m.setFloat("tg_heat_level_right", float32(pv.TgHeatLevelR), "lvl")
+	m.setFloat("target_heat_level_left", float32(pv.TargetHeatLevelL), "lvl")
+	m.setFloat("target_heat_level_right", float32(pv.TargetHeatLevelR), "lvl")
 	m.setFloat("heat_level_left", float32(pv.HeatLevelL), "lvl")
 	m.setFloat("heat_level_right", float32(pv.HeatLevelR), "lvl")
 	m.setFloat("heat_time_left_seconds", float32(pv.HeatTimeL), "s")
@@ -364,7 +385,8 @@ func (m *Manager) setFloat(id string, val float32, unit string) {
 	}
 	fs, ok := m.floatSensors[id]
 	if !ok {
-		fs = m.newFloatSensor(id, unit)
+		_, disabled := m.disabledByDefault[id]
+		fs = m.newFloatSensor(id, unit, disabled)
 		if err := m.node.Registry.RegisterSensor(fs); err != nil {
 			slog.Error("register sensor", "id", id, "err", err)
 			return
@@ -379,10 +401,11 @@ func (m *Manager) setFloat(id string, val float32, unit string) {
 	}
 }
 
-func (m *Manager) newFloatSensor(id, unit string) *floatSensor {
+func (m *Manager) newFloatSensor(id, unit string, disabled bool) *floatSensor {
 	cfg := &entity.EntityConfig{
-		ID:   id,
-		Name: prettyName(id),
+		ID:                id,
+		Name:              prettyName(id),
+		DisabledByDefault: disabled,
 	}
 	beVal := entity.NewBaseEntity(entity.DomainTypeSensor, cfg)
 	be := &beVal
@@ -398,7 +421,8 @@ func (m *Manager) setBinary(id string, on bool) {
 	}
 	bs, ok := m.binarySensors[id]
 	if !ok {
-		bs = m.newBinarySensor(id)
+		_, disabled := m.disabledByDefault[id]
+		bs = m.newBinarySensor(id, disabled)
 		if err := m.node.Registry.RegisterBinarySensor(bs); err != nil {
 			slog.Error("register binary sensor", "id", id, "err", err)
 			return
@@ -413,10 +437,11 @@ func (m *Manager) setBinary(id string, on bool) {
 	}
 }
 
-func (m *Manager) newBinarySensor(id string) *binSensor {
+func (m *Manager) newBinarySensor(id string, disabled bool) *binSensor {
 	cfg := &entity.EntityConfig{
-		ID:   id,
-		Name: prettyName(id),
+		ID:                id,
+		Name:              prettyName(id),
+		DisabledByDefault: disabled,
 	}
 	beVal := entity.NewBaseEntity(entity.DomainTypeBinarySensor, cfg)
 	be := &beVal
@@ -432,7 +457,8 @@ func (m *Manager) setText(id, val string) {
 	}
 	ts, ok := m.textSensors[id]
 	if !ok {
-		ts = m.newTextSensor(id)
+		_, disabled := m.disabledByDefault[id]
+		ts = m.newTextSensor(id, disabled)
 		if err := m.node.Registry.RegisterTextSensor(ts); err != nil {
 			slog.Error("register text sensor", "id", id, "err", err)
 			return
@@ -447,10 +473,11 @@ func (m *Manager) setText(id, val string) {
 	}
 }
 
-func (m *Manager) newTextSensor(id string) *textSensor {
+func (m *Manager) newTextSensor(id string, disabled bool) *textSensor {
 	cfg := &entity.EntityConfig{
-		ID:   id,
-		Name: prettyName(id),
+		ID:                id,
+		Name:              prettyName(id),
+		DisabledByDefault: disabled,
 	}
 	beVal := entity.NewBaseEntity(entity.DomainTypeTextSensor, cfg)
 	be := &beVal
@@ -463,6 +490,34 @@ func (m *Manager) baseCtxOrBG() context.Context {
 		return m.baseCtx
 	}
 	return context.Background()
+}
+
+// Pre-register core dynamic sensors so they appear immediately in HA.
+// Disabled-by-default: sensor_label, settings_raw, pod_heartbeat_epoch.
+func (m *Manager) preRegisterEntities() {
+	if m.disabledByDefault == nil {
+		m.disabledByDefault = map[string]struct{}{}
+	}
+	// Mark disabled sensors
+	for _, id := range []string{"sensor_label", "settings_raw", "pod_heartbeat_epoch"} {
+		m.disabledByDefault[id] = struct{}{}
+	}
+	// Numeric
+	m.setFloat("target_heat_level_left", 0, "lvl")
+	m.setFloat("target_heat_level_right", 0, "lvl")
+	m.setFloat("heat_level_left", 0, "lvl")
+	m.setFloat("heat_level_right", 0, "lvl")
+	m.setFloat("heat_time_left_seconds", 0, "s")
+	m.setFloat("heat_time_right_seconds", 0, "s")
+	// Binary
+	m.setBinary("water_level_ok", false)
+	m.setBinary("priming_active", false)
+	m.setBinary("pod_available", false)
+	// Text
+	m.setText("sensor_label", "")
+	m.setText("settings_raw", "")
+	// Heartbeat (disabled by default)
+	m.setFloat("pod_heartbeat_epoch", 0, "s")
 }
 
 // prettyName converts an identifier_with_underscores to "Identifier With Underscores".
