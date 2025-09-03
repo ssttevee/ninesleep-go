@@ -2,11 +2,14 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +24,83 @@ const (
 	// DefaultMaxLogEntries bounds the in‑memory log buffer.
 	DefaultMaxLogEntries = 200
 )
+
+// FrankenCommand mirrors the command nomenclature (utils.ts) from the original implementation.
+type FrankenCommand int
+
+const (
+	FrankenCommandHello               FrankenCommand = 0
+	FrankenCommandSetTemp             FrankenCommand = 1
+	FrankenCommandSetAlarm            FrankenCommand = 2
+	FrankenCommandReset               FrankenCommand = 3
+	FrankenCommandForceReset          FrankenCommand = 4
+	FrankenCommandAlarmLeft           FrankenCommand = 5
+	FrankenCommandAlarmRight          FrankenCommand = 6
+	FrankenCommandFormat              FrankenCommand = 7
+	FrankenCommandSetSettings         FrankenCommand = 8
+	FrankenCommandHeatLeft            FrankenCommand = 9
+	FrankenCommandHeatRight           FrankenCommand = 10
+	FrankenCommandLevelLeft           FrankenCommand = 11
+	FrankenCommandLevelRight          FrankenCommand = 12
+	FrankenCommandPrime               FrankenCommand = 13
+	FrankenCommandPleaseSendVariables FrankenCommand = 14
+)
+
+// String returns the symbolic name of the command (useful for logs / diagnostics).
+func (c FrankenCommand) String() string {
+	switch c {
+	case FrankenCommandHello:
+		return "HELLO"
+	case FrankenCommandSetTemp:
+		return "SET_TEMP"
+	case FrankenCommandSetAlarm:
+		return "SET_ALARM"
+	case FrankenCommandReset:
+		return "RESET"
+	case FrankenCommandForceReset:
+		return "FORCE_RESET"
+	case FrankenCommandAlarmLeft:
+		return "ALARM_LEFT"
+	case FrankenCommandAlarmRight:
+		return "ALARM_RIGHT"
+	case FrankenCommandFormat:
+		return "FORMAT"
+	case FrankenCommandSetSettings:
+		return "SET_SETTINGS"
+	case FrankenCommandHeatLeft:
+		return "HEAT_LEFT"
+	case FrankenCommandHeatRight:
+		return "HEAT_RIGHT"
+	case FrankenCommandLevelLeft:
+		return "LEVEL_LEFT"
+	case FrankenCommandLevelRight:
+		return "LEVEL_RIGHT"
+	case FrankenCommandPrime:
+		return "PRIME"
+	case FrankenCommandPleaseSendVariables:
+		return "PLEASE_SEND_VARIABLES"
+	default:
+		return fmt.Sprintf("UNKNOWN_COMMAND_%d", int(c))
+	}
+}
+
+// CommandID returns the raw integer ID used on the wire.
+func (c FrankenCommand) CommandID() int { return int(c) }
+
+// funcNameToFrankenCommand parallels utils.ts mapping allowing textual function names to resolve.
+var funcNameToFrankenCommand = map[string]FrankenCommand{
+	"reset":       FrankenCommandReset,
+	"force-reset": FrankenCommandForceReset,
+	"format":      FrankenCommandFormat,
+	"alarmR":      FrankenCommandAlarmRight,
+	"alarmL":      FrankenCommandAlarmLeft,
+	"setsettings": FrankenCommandSetSettings,
+	"prime":       FrankenCommandPrime,
+	"leftHeat":    FrankenCommandHeatLeft,
+	"leftLevel":   FrankenCommandLevelLeft,
+	"rightHeat":   FrankenCommandHeatRight,
+	"rightLevel":  FrankenCommandLevelRight,
+}
 
 // AlarmInput models an alarm configuration command.
 type AlarmInput struct {
@@ -63,9 +143,6 @@ type LogEntry struct {
 	Err        string
 }
 
-// VariablesParser converts raw variable output into a structured model.
-type VariablesParser func(raw string) *PodVariables
-
 // VariablesCallback is invoked after parsing a variables response.
 type VariablesCallback func(pv *PodVariables)
 
@@ -86,26 +163,11 @@ func WithMaxLogEntries(n int) Option {
 	}
 }
 
-// WithVariablesParser sets a custom parser for variables responses.
-func WithVariablesParser(vp VariablesParser) Option {
-	return func(p *PodController) { p.varParser = vp }
-}
-
 // WithVariablesCallback registers a callback invoked after each successful variables parse.
 func WithVariablesCallback(cb VariablesCallback) Option {
 	return func(p *PodController) {
 		if cb != nil {
 			p.varCallbacks = append(p.varCallbacks, cb)
-		}
-	}
-}
-
-// WithVariablesCommandIDs sets which command IDs should be treated as "variables" responses.
-func WithVariablesCommandIDs(ids ...int) Option {
-	return func(p *PodController) {
-		p.variablesCmdIDs = map[int]struct{}{}
-		for _, id := range ids {
-			p.variablesCmdIDs[id] = struct{}{}
 		}
 	}
 }
@@ -120,10 +182,8 @@ type PodController struct {
 	maxLogEntries int
 
 	// configuration
-	readTimeout     time.Duration
-	varParser       VariablesParser
-	varCallbacks    []VariablesCallback
-	variablesCmdIDs map[int]struct{}
+	readTimeout  time.Duration
+	varCallbacks []VariablesCallback
 
 	// last parsed variables
 	lastVariablesRaw string
@@ -133,12 +193,9 @@ type PodController struct {
 // New creates a PodController with provided options.
 func New(opts ...Option) *PodController {
 	p := &PodController{
-		logBuf:          make([]*LogEntry, 0, DefaultMaxLogEntries),
-		readTimeout:     DefaultSocketReadTimeout,
-		maxLogEntries:   DefaultMaxLogEntries,
-		varParser:       defaultVariablesParser,
-		varCallbacks:    nil,
-		variablesCmdIDs: map[int]struct{}{14: {}}, // default mapping
+		logBuf:        make([]*LogEntry, 0, DefaultMaxLogEntries),
+		readTimeout:   DefaultSocketReadTimeout,
+		maxLogEntries: DefaultMaxLogEntries,
 	}
 	for _, o := range opts {
 		o(p)
@@ -163,6 +220,17 @@ func (p *PodController) SetConnection(c net.Conn) {
 	})
 }
 
+// WaitForFranken waits for an inbound connection on the provided listener, sets it,
+// and returns the net.Conn (mirrors TS FrankenServer.waitForFranken).
+func (p *PodController) WaitForFranken(ln net.Listener) (net.Conn, error) {
+	conn, err := ln.Accept()
+	if err != nil {
+		return nil, err
+	}
+	p.SetConnection(conn)
+	return conn, nil
+}
+
 // ConnAlive reports whether there is an active connection.
 func (p *PodController) ConnAlive() bool {
 	p.mu.RLock()
@@ -179,77 +247,56 @@ func (p *PodController) LogSnapshot() []*LogEntry {
 	return out
 }
 
+// ExecuteFranken issues a FrankenCommand with an optional hex payload.
+func (p *PodController) ExecuteFranken(cmd FrankenCommand, payloadHex string) (string, error) {
+	return p.Execute(cmd.CommandID(), payloadHex)
+}
+
+// GetVariables sends PLEASE_SEND_VARIABLES and returns a raw key/value map.
+// Caching, structured parsing, and callbacks are performed inside Execute
+// when the variables command is issued.
+func (p *PodController) GetVariables() (map[string]string, error) {
+	resp, err := p.ExecuteFranken(FrankenCommandPleaseSendVariables, "")
+	if err != nil {
+		return nil, err
+	}
+	vars := map[string]string{}
+	lines := strings.Split(resp, "\n")
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		parts := strings.SplitN(l, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		vars[k] = v
+	}
+	return vars, nil
+}
+
 // Execute sends a raw command with optional hex payload and returns the response.
+// If the command is PLEASE_SEND_VARIABLES the variables are parsed, cached, and
+// callbacks are invoked (callbacks are executed after the lock is released).
 func (p *PodController) Execute(commandID int, payloadHex string) (string, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.conn == nil {
-		err := errors.New("no active connection")
-		p.appendLogLocked(&LogEntry{
-			Command: strconv.Itoa(commandID),
-			Err:     err.Error(),
-		})
+	resp, parsed, callbacks, err := p.executeLocked(commandID, payloadHex)
+	if err != nil {
 		return "", err
 	}
-
-	var buf bytes.Buffer
-	if payloadHex != "" {
-		fmt.Fprintf(&buf, "%d\n%s\n\n", commandID, payloadHex)
-	} else {
-		fmt.Fprintf(&buf, "%d\n\n", commandID)
-	}
-
-	_ = p.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	if _, err := p.conn.Write(buf.Bytes()); err != nil {
-		p.appendLogLocked(&LogEntry{
-			Command:    strconv.Itoa(commandID),
-			PayloadHex: payloadHex,
-			Err:        "write failed: " + err.Error(),
-		})
-		return "", err
-	}
-
-	_ = p.conn.SetReadDeadline(time.Now().Add(p.readTimeout))
-	readBuf := make([]byte, 8192)
-	n, rerr := p.conn.Read(readBuf)
-	var resp string
-	if rerr != nil {
-		if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
-			resp = ""
-		} else if errors.Is(rerr, io.EOF) {
-			resp = ""
-			p.connected = false
-		} else {
-			resp = ""
-		}
-	} else {
-		resp = string(readBuf[:n])
-	}
-
-	p.appendLogLocked(&LogEntry{
-		Command:    strconv.Itoa(commandID),
-		PayloadHex: payloadHex,
-		Response:   resp,
-		Err:        errorString(rerr),
-	})
-
-	if _, isVarCmd := p.variablesCmdIDs[commandID]; isVarCmd {
-		p.lastVariablesRaw = resp
-		if p.varParser != nil {
-			p.lastParsed = p.varParser(resp)
-			for _, cb := range p.varCallbacks {
-				cb(p.lastParsed)
-			}
+	if parsed != nil {
+		for _, cb := range callbacks {
+			cb(parsed)
 		}
 	}
-
 	return resp, nil
 }
 
 // ExecuteAlarm builds and sends an alarm command for a side.
 func (p *PodController) ExecuteAlarm(a AlarmInput) (string, error) {
-	cmdID := map[string]int{"left": 5, "right": 6}[a.Side]
+	cmdID := map[string]int{"left": int(FrankenCommandAlarmLeft), "right": int(FrankenCommandAlarmRight)}[a.Side]
 	if cmdID == 0 {
 		return "", fmt.Errorf("invalid side %q", a.Side)
 	}
@@ -275,7 +322,7 @@ func (p *PodController) ExecuteSettings(s SettingsInput) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return p.Execute(8, payloadHex)
+	return p.Execute(int(FrankenCommandSetSettings), payloadHex)
 }
 
 // ParsedVariables returns a deep copy of the last parsed variables (or nil).
@@ -318,8 +365,74 @@ func toCBORHex(v any) (string, error) {
 	return hex.EncodeToString(enc), nil
 }
 
-// defaultVariablesParser is a basic parser suitable for the raw key=value lines format.
-func defaultVariablesParser(raw string) *PodVariables {
+// executeLocked performs the core send/receive while holding the lock.
+// It returns: response string, parsed variables (if any), callbacks snapshot and error.
+func (p *PodController) executeLocked(commandID int, payloadHex string) (string, *PodVariables, []VariablesCallback, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.conn == nil {
+		err := errors.New("no active connection")
+		p.appendLogLocked(&LogEntry{
+			Command: strconv.Itoa(commandID),
+			Err:     err.Error(),
+		})
+		return "", nil, nil, err
+	}
+
+	var buf bytes.Buffer
+	if payloadHex != "" {
+		fmt.Fprintf(&buf, "%d\n%s\n\n", commandID, payloadHex)
+	} else {
+		fmt.Fprintf(&buf, "%d\n\n", commandID)
+	}
+
+	_ = p.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := p.conn.Write(buf.Bytes()); err != nil {
+		p.appendLogLocked(&LogEntry{
+			Command:    strconv.Itoa(commandID),
+			PayloadHex: payloadHex,
+			Err:        "write failed: " + err.Error(),
+		})
+		return "", nil, nil, err
+	}
+
+	_ = p.conn.SetReadDeadline(time.Now().Add(p.readTimeout))
+	readBuf := make([]byte, 8192)
+	n, rerr := p.conn.Read(readBuf)
+	var resp string
+	if rerr != nil {
+		if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+			resp = ""
+		} else if errors.Is(rerr, io.EOF) {
+			resp = ""
+			p.connected = false
+		} else {
+			resp = ""
+		}
+	} else {
+		resp = string(readBuf[:n])
+	}
+
+	p.appendLogLocked(&LogEntry{
+		Command:    strconv.Itoa(commandID),
+		PayloadHex: payloadHex,
+		Response:   resp,
+		Err:        errorString(rerr),
+	})
+
+	if commandID == int(FrankenCommandPleaseSendVariables) {
+		parsed := parseVariables(resp)
+		p.lastVariablesRaw = resp
+		p.lastParsed = parsed
+		callbacks := append([]VariablesCallback(nil), p.varCallbacks...)
+		return resp, parsed, callbacks, nil
+	}
+
+	return resp, nil, nil, nil
+}
+
+// parseVariables converts raw key=value lines into a PodVariables structure.
+func parseVariables(raw string) *PodVariables {
 	pv := &PodVariables{
 		Unknown: map[string]string{},
 		Raw:     raw,
@@ -409,4 +522,78 @@ func errorString(err error) string {
 		return "timeout"
 	}
 	return err.Error()
+}
+
+// TryCleanupUnixSocket removes a pre-existing unix domain socket file.
+//
+// Mirrors the tryCleanup behavior in the original FrankenServer.start (TS) but is
+// exposed so callers can explicitly manage lifecycle when embedding the controller.
+func (p *PodController) CleanupUnixSocket(path string) error {
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// StartFrankenUnixSocket creates and starts a unix domain socket listener used to
+// accept Franken (firmware) connections. This is analogous to FrankenServer.start
+// in the TypeScript reference. The caller is responsible for closing the returned
+// listener. If the underlying *net.UnixListener is obtained, SetUnlinkOnClose(true)
+// is invoked to ensure cleanup on close.
+//
+// Typical usage:
+//
+//	if err := TryCleanupUnixSocket(sockPath); err != nil { ... }
+//	ln, err := StartFrankenUnixSocket(sockPath)
+//	conn, err := controller.WaitForFranken(ln)
+func (p *PodController) StartUnixSocket(path string) (net.Listener, error) {
+	if err := p.CleanupUnixSocket(path); err != nil {
+		return nil, fmt.Errorf("cleanup socket: %w", err)
+	}
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if ul, ok := l.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(true)
+	}
+	return l, nil
+}
+
+// RunUnixSocketLoop ensures the directory for the socket exists, starts (or
+// reuses) a unix socket listener and continuously waits for incoming firmware
+// (franken) connections until the context is canceled. Each accepted
+// connection is set as the active connection. Returns when context is done
+// or when a non‑context related accept error occurs.
+func (p *PodController) RunUnixSocketLoop(ctx context.Context, sockPath string) error {
+	dir := filepath.Dir(sockPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+
+	ln, err := p.StartUnixSocket(sockPath)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		_, err := p.WaitForFranken(ln)
+		if err != nil {
+			// If context canceled, treat as graceful exit.
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+	}
 }

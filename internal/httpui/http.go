@@ -99,9 +99,9 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	)
 	switch action {
 	case "hello":
-		resp, err = s.pod.Execute(0, "")
+		resp, err = s.pod.ExecuteFranken(controller.FrankenCommandHello, "")
 	case "variables":
-		resp, err = s.pod.Execute(14, "")
+		resp, err = s.pod.ExecuteFranken(controller.FrankenCommandPleaseSendVariables, "")
 	case "alarm":
 		side := r.FormValue("side")
 		pl, _ := strconv.Atoi(r.FormValue("pl"))
@@ -122,23 +122,29 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "temperature":
 		side := r.FormValue("side")
 		val, _ := strconv.Atoi(r.FormValue("value"))
-		cmd := map[string]int{"left": 11, "right": 12}[side]
+		cmd := map[string]controller.FrankenCommand{
+			"left":  controller.FrankenCommandLevelLeft,
+			"right": controller.FrankenCommandLevelRight,
+		}[side]
 		if cmd == 0 {
 			err = fmt.Errorf("invalid side")
 			break
 		}
-		resp, err = s.pod.Execute(cmd, strconv.Itoa(val))
+		resp, err = s.pod.ExecuteFranken(cmd, strconv.Itoa(val))
 	case "temperature-duration":
 		side := r.FormValue("side")
 		val, _ := strconv.Atoi(r.FormValue("value"))
-		cmd := map[string]int{"left": 9, "right": 10}[side]
+		cmd := map[string]controller.FrankenCommand{
+			"left":  controller.FrankenCommandHeatLeft,
+			"right": controller.FrankenCommandHeatRight,
+		}[side]
 		if cmd == 0 {
 			err = fmt.Errorf("invalid side")
 			break
 		}
-		resp, err = s.pod.Execute(cmd, strconv.Itoa(val))
+		resp, err = s.pod.ExecuteFranken(cmd, strconv.Itoa(val))
 	case "prime":
-		resp, err = s.pod.Execute(13, "")
+		resp, err = s.pod.ExecuteFranken(controller.FrankenCommandPrime, "")
 	case "raw":
 		cmdID, _ := strconv.Atoi(r.FormValue("cmd"))
 		payload := strings.TrimSpace(r.FormValue("payload"))
