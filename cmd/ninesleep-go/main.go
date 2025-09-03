@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +23,15 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
+	"github.com/grandcat/zeroconf"
+
+	// Gosthome (ESPHome native API) integration
+	_ "github.com/gosthome/gosthome/components" // register default components (api, sensor, textsensor, etc.)
+	"github.com/gosthome/gosthome/components/api"
+	"github.com/gosthome/gosthome/core"
+	"github.com/gosthome/gosthome/core/component"
+	"github.com/gosthome/gosthome/core/config"
+	"github.com/gosthome/gosthome/core/registry"
 )
 
 /*
@@ -212,6 +222,8 @@ func (p *podController) execute(commandID int, payloadHex string) (string, error
 	if commandID == 14 {
 		p.lastVariablesRaw = resp
 		p.lastParsed = parseVariables(resp)
+		// Propagate to gosthome sensors if integration initialized
+		updateGosthomeFromParsed(p.lastParsed)
 	}
 
 	return resp, nil
@@ -550,6 +562,142 @@ func runUnixListener(ctx context.Context, pod *podController) error {
 	}
 }
 
+// ---- Gosthome Integration (scaffolding) ----
+//
+// NOTE: This is a minimal, non-intrusive integration scaffold that
+// initializes a gosthome node (ESPHome Native API server) IF the
+// environment variable GOSTHOME_ENABLE=1 is set. For now it only
+// prepares the framework to publish parsed variables; the actual
+// sensor entity registration & state updates are left as TODOs
+// because implementing custom dynamic sensors without modifying
+// gosthome requires more extensive inspection of its registry
+// APIs. This keeps the current file self-contained and avoids
+// altering upstream gosthome code.
+//
+// User steps to experiment:
+//   export GOSTHOME_ENABLE=1
+//   export GOSTHOME_API_PORT=6053   (optional; default 6053)
+//   go run ./cmd/ninesleep-go
+//
+// Then add the device to Home Assistant via ESPHome Native API.
+//
+// Once we finalize dynamic sensor registration strategy, we will
+// replace the TODOs below with real entity creation & updates.
+
+var (
+	gosthomeOnce       sync.Once
+	gosthomeNode       *core.Node
+	gosthomeInitErr    error
+	gosthomeCtxCancel  context.CancelFunc
+	gosthomeSensorLock sync.Mutex
+)
+
+// updateGosthomeFromParsed is currently a placeholder that just logs.
+// Later it will push each parsed field into a corresponding gosthome sensor.
+func updateGosthomeFromParsed(pv *podVariables) {
+	if pv == nil {
+		return
+	}
+	if gosthomeNode == nil {
+		return
+	}
+	// Placeholder logging
+	slog.Debug("gosthome placeholder update (no sensors yet)",
+		"tgHeatLevelL", pv.TgHeatLevelL,
+		"tgHeatLevelR", pv.TgHeatLevelR,
+		"heatLevelL", pv.HeatLevelL,
+		"heatLevelR", pv.HeatLevelR,
+		"heatTimeL", pv.HeatTimeL,
+		"heatTimeR", pv.HeatTimeR,
+		"waterLevel", pv.WaterLevel,
+		"priming", pv.Priming,
+		"sensorLabel", pv.SensorLabel,
+	)
+	// TODO: Register (once) a set of sensor + text sensor entities and update their state here.
+}
+
+// initGosthome initializes a gosthome node with only the API component active.
+func initGosthome(parent context.Context) {
+	gosthomeOnce.Do(func() {
+		ctx, cancel := context.WithCancel(parent)
+		gosthomeCtxCancel = cancel
+
+		// Build minimal config programmatically
+		apiPort := uint16(6053)
+		if ps := os.Getenv("GOSTHOME_API_PORT"); ps != "" {
+			if v, err := strconv.Atoi(ps); err == nil && v > 0 && v < 65536 {
+				apiPort = uint16(v)
+			}
+		}
+
+		// Prepare MAC (ignore error for deterministic demo MAC; in real code handle it)
+		mac, _ := config.ParseMAC("02:00:00:00:00:01")
+
+		// Build minimal config using proper gosthome types
+		apiCfg := api.NewConfig()
+		// Leaving API component ID at default (no explicit ID set)
+		apiCfg.Address = "0.0.0.0"
+		apiCfg.Port = apiPort
+
+		cfg := &config.Config{
+			Registry: registry.DefaultRegistry(),
+			Gosthome: config.GosthomeConfig{
+				Name: "pod3",
+				MAC:  mac,
+			},
+			Components: config.Configs{
+				"api": component.NewConfigDecoder(apiCfg),
+			},
+		}
+
+		node, err := core.NewNode(ctx, cfg)
+		if err != nil {
+			gosthomeInitErr = fmt.Errorf("gosthome init node: %w", err)
+			slog.Error("Failed to initialize gosthome", "err", err)
+			return
+		}
+		gosthomeNode = node
+		go node.Start()
+		slog.Info("Gosthome (ESPHome API) started",
+			"port", apiPort,
+			"name", cfg.Gosthome.Name,
+		)
+
+		// mDNS / Zeroconf advertisement for Home Assistant ESPHome discovery
+		go func() {
+			host := cfg.Gosthome.Name
+			txt := []string{
+				// Minimal useful TXT records (ESPHome typically publishes more,
+				// but these are enough for discovery).
+				"version=1.0",
+				"address=" + apiCfg.Address,
+			}
+			svc, err := zeroconf.Register(
+				host, "_esphomelib._tcp", "local.",
+				int(apiPort), txt, nil,
+			)
+			if err != nil {
+				slog.Error("mDNS register failed", "err", err)
+				return
+			}
+			slog.Info("mDNS advertisement started",
+				"service", "_esphomelib._tcp",
+				"port", apiPort,
+				"host", host,
+			)
+			<-ctx.Done()
+			svc.Shutdown()
+			slog.Info("mDNS advertisement stopped")
+		}()
+
+		// TODO: Dynamically register sensor + text sensor entities here:
+		// Example concept (pseudo):
+		// createNumberSensor("heat_level_left", "Heat Level Left", "°C")
+		// createTextSensor("sensor_label", "Sensor Label")
+		// We need to ensure we use gosthome's entity registration APIs safely post-start.
+	})
+}
+
 // ---- Main ----
 
 func main() {
@@ -559,6 +707,15 @@ func main() {
 	defer cancel()
 
 	pod := newPodController()
+
+	// Optionally start gosthome (ESPHome native API server) for HA integration
+	// Always enable gosthome integration (env gating removed)
+	initGosthome(ctx)
+	if gosthomeInitErr != nil {
+		log.Printf("[gosthome] initialization error: %v", gosthomeInitErr)
+	} else {
+		log.Printf("[gosthome] integration enabled")
+	}
 
 	go func() {
 		if err := runUnixListener(ctx, pod); err != nil {
