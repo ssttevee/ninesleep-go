@@ -93,7 +93,11 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "variables":
 		resp, err = s.pod.ExecuteFranken(controller.FrankenCommandPleaseSendVariables, "")
 	case "alarm":
-		side := r.FormValue("side")
+		side, err := controller.SideFromString(r.FormValue("side"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		pl, _ := strconv.Atoi(r.FormValue("pl"))
 		du, _ := strconv.Atoi(r.FormValue("du"))
 		tt, _ := strconv.ParseInt(r.FormValue("tt"), 10, 64)
@@ -110,31 +114,23 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		lb, _ := strconv.Atoi(r.FormValue("lb"))
 		resp, err = s.pod.ExecuteSettings(controller.SettingsInput{LB: lb})
 	case "temperature":
-		side := r.FormValue("side")
-		val, _ := strconv.Atoi(r.FormValue("value"))
-		cmd := map[string]controller.FrankenCommand{
-			"left":  controller.FrankenCommandLevelLeft,
-			"right": controller.FrankenCommandLevelRight,
-		}[side]
-		if cmd == 0 {
-			err = fmt.Errorf("invalid side")
-			break
+		side, err := controller.SideFromString(r.FormValue("side"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
-		resp, err = s.pod.ExecuteFranken(cmd, strconv.Itoa(val))
+		val, _ := strconv.Atoi(r.FormValue("value"))
+		err = s.pod.ExecuteHeatLevel(side, val)
 	case "temperature-duration":
-		side := r.FormValue("side")
-		val, _ := strconv.Atoi(r.FormValue("value"))
-		cmd := map[string]controller.FrankenCommand{
-			"left":  controller.FrankenCommandHeatLeft,
-			"right": controller.FrankenCommandHeatRight,
-		}[side]
-		if cmd == 0 {
-			err = fmt.Errorf("invalid side")
-			break
+		side, err := controller.SideFromString(r.FormValue("side"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
-		resp, err = s.pod.ExecuteFranken(cmd, strconv.Itoa(val))
+		val, _ := strconv.Atoi(r.FormValue("value"))
+		err = s.pod.ExecuteHeatDuration(side, val)
 	case "prime":
-		resp, err = s.pod.ExecuteFranken(controller.FrankenCommandPrime, "")
+		err = s.pod.ExecutePrime()
 	case "raw":
 		cmdID, _ := strconv.Atoi(r.FormValue("cmd"))
 		payload := strings.TrimSpace(r.FormValue("payload"))

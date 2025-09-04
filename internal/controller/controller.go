@@ -92,24 +92,38 @@ func (c FrankenCommand) String() string {
 // CommandID returns the raw integer ID used on the wire.
 func (c FrankenCommand) CommandID() int { return int(c) }
 
-// funcNameToFrankenCommand parallels utils.ts mapping allowing textual function names to resolve.
-var funcNameToFrankenCommand = map[string]FrankenCommand{
-	"reset":       FrankenCommandReset,
-	"force-reset": FrankenCommandForceReset,
-	"format":      FrankenCommandFormat,
-	"alarmR":      FrankenCommandAlarmRight,
-	"alarmL":      FrankenCommandAlarmLeft,
-	"setsettings": FrankenCommandSetSettings,
-	"prime":       FrankenCommandPrime,
-	"leftHeat":    FrankenCommandHeatLeft,
-	"leftLevel":   FrankenCommandLevelLeft,
-	"rightHeat":   FrankenCommandHeatRight,
-	"rightLevel":  FrankenCommandLevelRight,
+type Side int
+
+const (
+	SideLeft  Side = 0
+	SideRight Side = 1
+)
+
+func SideFromString(s string) (Side, error) {
+	switch strings.ToLower(s) {
+	case "left":
+		return SideLeft, nil
+	case "right":
+		return SideRight, nil
+	default:
+		return 0, fmt.Errorf("invalid side: %s", s)
+	}
+}
+
+func (s Side) String() string {
+	switch s {
+	case SideLeft:
+		return "LEFT"
+	case SideRight:
+		return "RIGHT"
+	default:
+		return fmt.Sprintf("UNKNOWN_SIDE_%d", int(s))
+	}
 }
 
 // AlarmInput models an alarm configuration command.
 type AlarmInput struct {
-	Side    string // logical side ("left"/"right")
+	Side    Side   // logical side ("left"/"right")
 	PL      int    // intensity percentage (0-100)
 	DU      int    // duration seconds
 	TT      int64  // unix time
@@ -170,9 +184,10 @@ func WithMITM(enabled bool) Option {
 type PodController struct {
 	mu sync.RWMutex
 
-	conn      net.Conn
-	connected bool
-	mitmMode  bool
+	conn        net.Conn
+	connected   bool
+	mitmMode    bool
+	connectedCh chan struct{}
 
 	// reconnectCh is a length-1 buffered channel used to signal a transition
 	// from connected -> disconnected.
@@ -194,11 +209,21 @@ type PodController struct {
 func New(opts ...Option) *PodController {
 	p := &PodController{
 		readTimeout: DefaultSocketReadTimeout,
+		connectedCh: make(chan struct{}),
+		reconnectCh: make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(p)
 	}
 	return p
+}
+
+func (p *PodController) WaitForConn() <-chan struct{} {
+	p.mu.RLock()
+	ch := p.connectedCh
+	p.mu.RUnlock()
+
+	return ch
 }
 
 // setConnection sets (and replaces) the active connection.
@@ -209,8 +234,21 @@ func (p *PodController) setConnection(c net.Conn) {
 		_ = p.conn.Close()
 	}
 	p.conn = c
-	p.connected = true
-	log.Printf("[controller] new connection from %s", c.RemoteAddr().String())
+	p.connected = c != nil
+	if p.connected {
+		close(p.connectedCh)
+
+		log.Printf("[controller] new connection from %s", c.RemoteAddr().String())
+	} else {
+		select {
+		case p.reconnectCh <- struct{}{}:
+		default:
+		}
+
+		p.connectedCh = make(chan struct{})
+
+		log.Printf("[controller] connection lost")
+	}
 }
 
 // waitForFranken waits for an inbound connection on the provided listener, sets it,
@@ -260,12 +298,23 @@ func (p *PodController) ExecuteRaw(commandID int, payloadHex string) (string, er
 	return resp, nil
 }
 
+func (p *PodController) ExecuteHeatLevel(side Side, level int) error {
+	_, err := p.ExecuteRaw(int(FrankenCommandLevelLeft)+int(side), strconv.Itoa(level))
+	return err
+}
+
+func (p *PodController) ExecuteHeatDuration(side Side, duration int) error {
+	_, err := p.ExecuteRaw(int(FrankenCommandHeatLeft)+int(side), strconv.Itoa(duration))
+	return err
+}
+
+func (p *PodController) ExecutePrime() error {
+	_, err := p.ExecuteRaw(int(FrankenCommandPrime), "")
+	return err
+}
+
 // ExecuteAlarm builds and sends an alarm command for a side.
 func (p *PodController) ExecuteAlarm(a AlarmInput) (string, error) {
-	cmdID := map[string]int{"left": int(FrankenCommandAlarmLeft), "right": int(FrankenCommandAlarmRight)}[a.Side]
-	if cmdID == 0 {
-		return "", fmt.Errorf("invalid side %q", a.Side)
-	}
 	data := map[string]any{
 		"pl": uint8(a.PL),
 		"du": uint16(a.DU),
@@ -276,7 +325,7 @@ func (p *PodController) ExecuteAlarm(a AlarmInput) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return p.ExecuteRaw(cmdID, payloadHex)
+	return p.ExecuteRaw(int(FrankenCommandAlarmLeft)+int(a.Side), payloadHex)
 }
 
 // ExecuteSettings sends a settings command (currently LED brightness only).
@@ -348,11 +397,7 @@ func (p *PodController) executeLocked(commandID int, payloadHex string) (string,
 			resp = ""
 		} else if errors.Is(rerr, io.EOF) {
 			resp = ""
-			p.connected = false
-			select {
-			case p.reconnectCh <- struct{}{}:
-			default:
-			}
+			p.setConnection(nil)
 		} else {
 			resp = ""
 		}
