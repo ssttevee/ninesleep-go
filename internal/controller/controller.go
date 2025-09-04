@@ -185,9 +185,9 @@ func WithMITM(enabled bool) Option {
 type PodController struct {
 	mu sync.RWMutex
 
-	mitmConnected          bool
-	onMitmConnected        func(connected bool)
-	onMitmBrightnessChange func(brightness int)
+	mitmConnected   bool
+	onMitmConnected func(connected bool)
+	onMitmRequest   func(command FrankenCommand, payload string)
 
 	conn        net.Conn
 	connected   bool
@@ -252,8 +252,8 @@ func (p *PodController) SetOnMitmConnected(f func(connected bool)) {
 	f(connected)
 }
 
-func (p *PodController) SetOnMitmBrightnessChange(f func(brightness int)) {
-	p.onMitmBrightnessChange = f
+func (p *PodController) SetOnMitmRequest(f func(command FrankenCommand, payload string)) {
+	p.onMitmRequest = f
 }
 
 func (p *PodController) WaitForConn() <-chan struct{} {
@@ -790,19 +790,8 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 			log.Printf("[mitm] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(execErr))
 		}
 
-		if commandID == int(FrankenCommandSetSettings) && payloadHex != "" && p.onMitmBrightnessChange != nil {
-			if raw, err := hex.DecodeString(payloadHex); err != nil {
-				log.Printf("[mitm] settings decode hex error: %v", err)
-			} else {
-				var decoded map[string]any
-				if err := cbor.Unmarshal(raw, &decoded); err != nil {
-					log.Printf("[mitm] settings cbor unmarshal error: %v", err)
-				} else {
-					if v, ok := decoded["lb"]; ok {
-						p.onMitmBrightnessChange(int(v.(uint64)))
-					}
-				}
-			}
+		if p.onMitmRequest != nil {
+			p.onMitmRequest(FrankenCommand(commandID), payloadHex)
 		}
 	}
 }

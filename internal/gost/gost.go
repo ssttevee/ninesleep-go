@@ -2,16 +2,19 @@ package gost
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"math"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"eightsleep-esphome/internal/controller"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/grandcat/zeroconf"
 
 	"github.com/gosthome/gosthome/components/api"
@@ -274,8 +277,42 @@ func (m *Manager) initNode(ctx context.Context) {
 	}
 
 	m.setBinary("pod_available", false)
-	m.pod.SetOnMitmBrightnessChange(func(brightness int) {
-		m.setNumber("led_brightness", float32(brightness))
+	m.pod.SetOnMitmRequest(func(command controller.FrankenCommand, payload string) {
+		switch command {
+		case controller.FrankenCommandSetSettings:
+			if payload != "" {
+				if raw, err := hex.DecodeString(payload); err == nil {
+					var decoded map[string]any
+					if err := cbor.Unmarshal(raw, &decoded); err == nil {
+						if v, ok := decoded["lb"]; ok {
+							if lb, ok := v.(uint64); ok {
+								m.setNumber("led_brightness", float32(lb))
+							}
+						}
+					}
+				}
+			}
+
+		case controller.FrankenCommandHeatLeft:
+			if n, err := strconv.Atoi(payload); err == nil {
+				m.setNumber("heat_time_left_seconds", float32(n))
+			}
+
+		case controller.FrankenCommandHeatRight:
+			if n, err := strconv.Atoi(payload); err == nil {
+				m.setNumber("heat_time_right_seconds", float32(n))
+			}
+
+		case controller.FrankenCommandLevelLeft:
+			if n, err := strconv.Atoi(payload); err == nil {
+				m.setNumber("target_heat_level_left", float32(n))
+			}
+
+		case controller.FrankenCommandLevelRight:
+			if n, err := strconv.Atoi(payload); err == nil {
+				m.setNumber("target_heat_level_right", float32(n))
+			}
+		}
 	})
 	m.pod.SetOnMitmConnected(func(connected bool) {
 		m.setBinary("cloud_connected", connected)
