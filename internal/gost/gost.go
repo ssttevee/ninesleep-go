@@ -278,9 +278,9 @@ func (m *Manager) initNode(ctx context.Context) {
 		m.setNumber("led_brightness", float32(brightness))
 	})
 	m.pod.SetOnMitmConnected(func(connected bool) {
-		m.setBinary("upstream_connected", connected)
+		m.setBinary("cloud_connected", connected)
 	})
-	m.setSwitch("enable_upstream", m.pod.GetMitmMode())
+	m.setSwitch("enable_cloud", m.pod.GetMitmMode())
 }
 
 func (m *Manager) runMDNS(ctx context.Context, apiCfg *api.Config) {
@@ -936,14 +936,14 @@ func (m *Manager) preRegisterEntities(ctx context.Context) {
 	m.registerBinarySensor("water_level_ok", false, &binSensor{})
 	m.registerBinarySensor("priming_active", false, &binSensor{class: entity.BinarySensorDeviceClassRunning})
 	m.registerBinarySensor("pod_available", false, &binSensor{})
-	m.registerBinarySensor("upstream_connected", false, &binSensor{class: entity.BinarySensorDeviceClassRunning})
+	m.registerBinarySensor("cloud_connected", false, &binSensor{class: entity.BinarySensorDeviceClassRunning})
 	// Text sensors
 	m.registerTextSensor("sensor_label", true, &textSensor{})
 	m.registerTextSensor("settings_raw", true, &textSensor{})
 	// Switches
 	m.registerSwitchEntity("heat_left", false, &switchEntity{onSet: m.heatSwitchHandler(controller.SideLeft, &m.stopLeftHeating)})
 	m.registerSwitchEntity("heat_right", false, &switchEntity{onSet: m.heatSwitchHandler(controller.SideRight, &m.stopRightHeating)})
-	m.registerSwitchEntity("enable_upstream", false, &switchEntity{onSet: func(ctx context.Context, newState bool, current entity.SwitchState) error {
+	m.registerSwitchEntity("enable_cloud", false, &switchEntity{onSet: func(ctx context.Context, newState bool, current entity.SwitchState) error {
 		m.pod.SetMitmMode(newState)
 		return nil
 	}})
