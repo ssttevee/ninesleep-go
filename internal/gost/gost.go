@@ -416,6 +416,8 @@ func (m *Manager) updateAvailability() {
 	m.setBinary("pod_available", ok)
 }
 
+const heatLoopSeconds = 21600
+
 func (m *Manager) startHeatLoop(ctx context.Context, side controller.Side) (func() error, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
@@ -423,14 +425,14 @@ func (m *Manager) startHeatLoop(ctx context.Context, side controller.Side) (func
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(60 * time.Second):
+			case <-time.After(time.Hour):
 			}
 
-			if err := m.pod.ExecuteHeatDuration(side, 180); err != nil {
+			if err := m.pod.ExecuteHeatDuration(side, heatLoopSeconds); err != nil {
 				slog.Error("failed to execute heat duration: %v", "err", err)
 			}
 
-			m.setFloat(fmt.Sprintf("heat_time_%s_seconds", strings.ToLower(side.String())), 180)
+			m.setFloat(fmt.Sprintf("heat_time_%s_seconds", strings.ToLower(side.String())), heatLoopSeconds)
 		}
 	}()
 
@@ -439,7 +441,7 @@ func (m *Manager) startHeatLoop(ctx context.Context, side controller.Side) (func
 		cancel()
 
 		return m.pod.ExecuteHeatDuration(side, 0)
-	}, m.pod.ExecuteHeatDuration(side, 180)
+	}, m.pod.ExecuteHeatDuration(side, heatLoopSeconds)
 }
 
 // -------- Entity implementations --------
