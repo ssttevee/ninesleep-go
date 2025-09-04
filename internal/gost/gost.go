@@ -41,8 +41,6 @@ type Manager struct {
 	pod       *controller.PodController
 	onceStart sync.Once
 
-	onceOnPodConnect sync.Once
-
 	// entity abstraction
 	stopLeftHeating  func() error
 	stopRightHeating func() error
@@ -339,13 +337,6 @@ func (m *Manager) pollOnce() {
 		m.updateAvailability()
 		return
 	}
-	m.onceOnPodConnect.Do(func() {
-		if num, ok := m.numberEntities["led_brightness"]; ok {
-			if err := num.SetValue(context.Background(), 10); err != nil {
-				slog.Warn("failed to set led_brightness", "err", err)
-			}
-		}
-	})
 	m.lastPollSuccess = now
 	m.updateFromParsed()
 	m.updateAvailability()
@@ -357,6 +348,7 @@ func (m *Manager) updateFromParsed() {
 		return
 	}
 	// Numeric
+	m.setNumber("led_brightness", float32(pv.LedBrightness))
 	m.setNumber("target_heat_level_left", float32(pv.TargetHeatLevelL))
 	m.setNumber("target_heat_level_right", float32(pv.TargetHeatLevelR))
 	m.setFloat("heat_level_left", float32(pv.HeatLevelL))

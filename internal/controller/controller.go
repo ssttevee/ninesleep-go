@@ -147,6 +147,7 @@ type PodVariables struct {
 	WaterLevel       bool   `json:"waterLevel"`
 	Priming          bool   `json:"priming"`
 	SettingsRaw      string `json:"settingsRaw"`
+	LedBrightness    int    `json:"ledBrightness"`
 
 	Unknown    map[string]string `json:"unknown,omitempty"`
 	ParseError string            `json:"parseError,omitempty"`
@@ -526,6 +527,17 @@ func parseVariables(raw string) *PodVariables {
 			pv.Priming = strings.EqualFold(val, "true")
 		case "settings":
 			pv.SettingsRaw = stripQuotes(val)
+
+			if raw, err := hex.DecodeString(pv.SettingsRaw); err == nil {
+				var decoded map[string]any
+				if err := cbor.Unmarshal(raw, &decoded); err == nil {
+					if v, ok := decoded["lb"]; ok {
+						if lb, ok := v.(uint64); ok {
+							pv.LedBrightness = int(lb)
+						}
+					}
+				}
+			}
 		default:
 			pv.Unknown[key] = val
 		}
