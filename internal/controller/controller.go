@@ -360,14 +360,14 @@ func (p *PodController) executeLocked(commandID int, payloadHex string) (string,
 		resp = string(readBuf[:n])
 	}
 
-	log.Printf("[controller] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(rerr))
-
 	if commandID == int(FrankenCommandPleaseSendVariables) {
 		parsed := parseVariables(resp)
 		p.lastVariablesRaw = resp
 		p.lastParsed = parsed
 		callbacks := append([]VariablesCallback(nil), p.varCallbacks...)
 		return resp, parsed, callbacks, nil
+	} else {
+		log.Printf("[controller] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(rerr))
 	}
 
 	return resp, nil, nil, nil
@@ -667,7 +667,9 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 		}
 
 		// Log the MITM interaction.
-		log.Printf("[mitm] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(execErr))
+		if commandID != int(FrankenCommandPleaseSendVariables) {
+			log.Printf("[mitm] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(execErr))
+		}
 	}
 }
 
