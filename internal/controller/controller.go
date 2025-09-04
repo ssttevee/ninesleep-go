@@ -121,6 +121,15 @@ func (s Side) String() string {
 	}
 }
 
+func (s Side) Opposite() Side {
+	switch s {
+	case SideLeft:
+		return SideRight
+	default:
+		return SideLeft
+	}
+}
+
 // AlarmInput models an alarm configuration command.
 type AlarmInput struct {
 	Side    Side   // logical side ("left"/"right")

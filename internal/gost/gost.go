@@ -59,6 +59,7 @@ const (
 	EntityIDTemperatureOffset    = "climate_temperature_offset"
 	EntityIDClimateLeft          = "climate_left"
 	EntityIDClimateRight         = "climate_right"
+	EntityIDSyncSides            = "sync_sides"
 )
 
 // Manager owns the gosthome (ESPHome native API) node and registered entities.
@@ -71,6 +72,7 @@ type Manager struct {
 	baseCtx   context.Context
 	pod       *controller.PodController
 	onceStart sync.Once
+	syncSides bool
 
 	// entity abstraction
 	stopLeftHeating  func() error
@@ -346,6 +348,7 @@ func (m *Manager) initNode(ctx context.Context) {
 		m.setBinary(EntityIDCloudConnected, connected)
 	})
 	m.setSwitch(EntityIDEnableCloud, m.pod.GetMitmMode())
+	m.setSwitch(EntityIDSyncSides, false)
 	m.setNumber(EntityIDTemperatureOffset, 25)
 }
 
@@ -435,9 +438,10 @@ func (m *Manager) updateFromParsed() {
 	// Heartbeat (fast path)
 	m.setFloat(EntityIDPodHeartbeatEpoch, float32(time.Now().Unix()))
 
+	// Climates
 	offset := m.numberEntities[EntityIDTemperatureOffset].State().State
 	m.updateClimate(EntityIDClimateLeft, func(cs *entity.ClimateState) {
-		cs.TargetTemperature = float32(pv.TargetHeatLevelL)/10 + m.numberEntities[EntityIDTemperatureOffset].State().State
+		cs.TargetTemperature = offset + float32(pv.TargetHeatLevelL)/10
 		if pv.HeatTimeL > 0 {
 			cs.Mode = entity.ClimateModeHeatCool
 		} else {
@@ -452,7 +456,7 @@ func (m *Manager) updateFromParsed() {
 	})
 
 	m.updateClimate(EntityIDClimateRight, func(cs *entity.ClimateState) {
-		cs.TargetTemperature = float32(pv.TargetHeatLevelR) / 10
+		cs.TargetTemperature = offset + float32(pv.TargetHeatLevelR)/10
 		if pv.HeatTimeR > 0 {
 			cs.Mode = entity.ClimateModeHeatCool
 		} else {
@@ -465,6 +469,20 @@ func (m *Manager) updateFromParsed() {
 		)
 		cs.CurrentTemperature = offset + float32(pv.HeatLevelR)/10
 	})
+
+	if m.syncSides {
+		if pv.TargetHeatLevelL != pv.TargetHeatLevelR {
+			if err := m.pod.ExecuteHeatLevel(controller.SideRight, pv.TargetHeatLevelL); err != nil {
+				slog.Warn("failed to sync heat level", "err", err)
+			}
+		}
+
+		if (pv.HeatTimeL > 0) != (pv.HeatTimeR > 0) {
+			if err := m.doHeatSwitch(context.Background(), controller.SideRight, pv.HeatTimeL > 0); err != nil {
+				slog.Error("failed to sync heat switch", "err", err)
+			}
+		}
+	}
 }
 
 func (m *Manager) updateAvailability() {
@@ -1016,31 +1034,64 @@ func (m *Manager) doHeatSwitch(ctx context.Context, side controller.Side, state 
 	return nil
 }
 
+func (m *Manager) heatSwitchEffect(ctx context.Context, side controller.Side, newState bool) error {
+	if err := m.doHeatSwitch(ctx, side, newState); err != nil {
+		return err
+	}
+
+	m.updateClimate(fmt.Sprintf("climate_%s", side), func(cs *entity.ClimateState) {
+		if newState {
+			cs.Mode = entity.ClimateModeHeatCool
+		} else {
+			cs.Mode = entity.ClimateModeOff
+		}
+		cs.Action = climateAction(
+			newState,
+			m.floatSensors[fmt.Sprintf("heat_level_%s", side)].State().State,
+			m.numberEntities[fmt.Sprintf("target_heat_level_%s", side)].State().State,
+		)
+	})
+
+	return nil
+}
+
 func (m *Manager) heatSwitchHandler(side controller.Side) func(ctx context.Context, newState bool, current entity.SwitchState) error {
 	return func(ctx context.Context, newState bool, current entity.SwitchState) error {
 		if current.State == newState {
 			return nil
 		}
 
-		if err := m.doHeatSwitch(ctx, side, newState); err != nil {
+		if err := m.heatSwitchEffect(ctx, side, newState); err != nil {
 			return err
 		}
 
-		m.updateClimate(fmt.Sprintf("climate_%s", side), func(cs *entity.ClimateState) {
-			if newState {
-				cs.Mode = entity.ClimateModeHeatCool
-			} else {
-				cs.Mode = entity.ClimateModeOff
+		if m.syncSides {
+			if err := m.heatSwitchEffect(ctx, side.Opposite(), newState); err != nil {
+				return err
 			}
-			cs.Action = climateAction(
-				newState,
-				m.floatSensors[fmt.Sprintf("heat_level_%s", side)].State().State,
-				m.numberEntities[fmt.Sprintf("target_heat_level_%s", side)].State().State,
-			)
-		})
+
+			m.setSwitch(fmt.Sprintf("heat_%s", side.Opposite()), newState)
+		}
 
 		return nil
 	}
+}
+
+func (m *Manager) heatLevelEffect(ctx context.Context, side controller.Side, newState float32) error {
+	if err := m.pod.ExecuteHeatLevel(side, int(newState)); err != nil {
+		return err
+	}
+
+	m.updateClimate(fmt.Sprintf("climate_%s", side), func(cs *entity.ClimateState) {
+		cs.TargetTemperature = m.numberEntities[EntityIDTemperatureOffset].State().State + newState/10
+		cs.Action = climateAction(
+			m.switchEntities[fmt.Sprintf("heat_%s", side)].State().State,
+			m.floatSensors[fmt.Sprintf("heat_level_%s", side)].State().State,
+			newState,
+		)
+	})
+
+	return nil
 }
 
 func (m *Manager) heatLevelHandler(side controller.Side) func(ctx context.Context, newState float32, current entity.NumberState) error {
@@ -1050,17 +1101,19 @@ func (m *Manager) heatLevelHandler(side controller.Side) func(ctx context.Contex
 		}
 
 		newState = max(-100, min(100, float32(math.Floor(float64(newState)))))
+		if err := m.heatLevelEffect(ctx, side, newState); err != nil {
+			return err
+		}
 
-		m.updateClimate(fmt.Sprintf("climate_%s", side), func(cs *entity.ClimateState) {
-			cs.TargetTemperature = m.numberEntities[EntityIDTemperatureOffset].State().State + newState/10
-			cs.Action = climateAction(
-				m.switchEntities[fmt.Sprintf("heat_%s", side)].State().State,
-				m.floatSensors[fmt.Sprintf("heat_level_%s", side)].State().State,
-				newState,
-			)
-		})
+		if m.syncSides {
+			if err := m.heatLevelEffect(ctx, side.Opposite(), newState); err != nil {
+				return err
+			}
 
-		return m.pod.ExecuteHeatLevel(side, int(newState))
+			m.setNumber(fmt.Sprintf("target_heat_level_%s", side.Opposite()), newState)
+		}
+
+		return nil
 	}
 }
 
@@ -1080,15 +1133,41 @@ func climateAction(on bool, currentLevel, targetLevel float32) entity.ClimateAct
 	return entity.ClimateActionOff
 }
 
+func (m *Manager) climateEffectTemp(ctx context.Context, side controller.Side, newLevel float32) error {
+	if err := m.pod.ExecuteHeatLevel(side, int(newLevel)); err != nil {
+		return err
+	}
+
+	m.setNumber(fmt.Sprintf("target_heat_level_%s", side), newLevel)
+
+	return nil
+}
+
+func (m *Manager) climateEffectMode(ctx context.Context, side controller.Side, newMode entity.ClimateMode) error {
+	state := newMode == entity.ClimateModeHeatCool
+	if err := m.doHeatSwitch(ctx, side, state); err != nil {
+		return err
+	}
+
+	m.setSwitch(fmt.Sprintf("heat_%s", side), state)
+
+	return nil
+}
+
 func (m *Manager) climateHandler(side controller.Side) func(ctx context.Context, desired entity.ClimateState, current entity.ClimateState) (entity.ClimateState, error) {
 	return func(ctx context.Context, desired entity.ClimateState, current entity.ClimateState) (entity.ClimateState, error) {
 		if desired.TargetTemperature != current.TargetTemperature {
 			newLevel := max(-100, min(100, (desired.TargetTemperature-m.numberEntities[EntityIDTemperatureOffset].State().State)*10))
-			if err := m.pod.ExecuteHeatLevel(side, int(newLevel)); err != nil {
+			if err := m.climateEffectTemp(ctx, side, newLevel); err != nil {
 				return entity.ClimateState{}, err
 			}
 
-			m.setNumber(fmt.Sprintf("target_heat_level_%s", side), newLevel)
+			if m.syncSides {
+				if err := m.climateEffectTemp(ctx, side.Opposite(), newLevel); err != nil {
+					return entity.ClimateState{}, err
+				}
+			}
+
 			current.TargetTemperature = desired.TargetTemperature
 		}
 
@@ -1102,18 +1181,28 @@ func (m *Manager) climateHandler(side controller.Side) func(ctx context.Context,
 			}
 
 			if !badMode {
-				state := current.Mode == entity.ClimateModeHeatCool
-				if err := m.doHeatSwitch(ctx, side, state); err != nil {
+				if err := m.climateEffectMode(ctx, side, current.Mode); err != nil {
 					return entity.ClimateState{}, err
 				}
 
-				m.setSwitch(fmt.Sprintf("heat_%s", side), state)
+				if m.syncSides {
+					if err := m.climateEffectMode(ctx, side.Opposite(), current.Mode); err != nil {
+						return entity.ClimateState{}, err
+					}
+				}
+
 				current.Action = climateAction(
-					state,
+					current.Mode == entity.ClimateModeHeatCool,
 					m.floatSensors[fmt.Sprintf("heat_level_%s", side)].State().State,
 					m.numberEntities[fmt.Sprintf("target_heat_level_%s", side)].State().State,
 				)
 			}
+		}
+
+		if m.syncSides {
+			m.updateClimate(fmt.Sprintf("climate_%s", side.Opposite()), func(cs *entity.ClimateState) {
+				*cs = current
+			})
 		}
 
 		return current, nil
@@ -1149,6 +1238,31 @@ func (m *Manager) preRegisterEntities() {
 	m.registerSwitchEntity(EntityIDHeatRight, false, &switchEntity{onSet: m.heatSwitchHandler(controller.SideRight)})
 	m.registerSwitchEntity(EntityIDEnableCloud, false, &switchEntity{onSet: func(ctx context.Context, newState bool, current entity.SwitchState) error {
 		m.pod.SetMitmMode(newState)
+		return nil
+	}})
+	m.registerSwitchEntity(EntityIDSyncSides, false, &switchEntity{onSet: func(ctx context.Context, newState bool, current entity.SwitchState) error {
+		m.syncSides = newState
+
+		if m.syncSides {
+			targetLevel := m.numberEntities[EntityIDTargetHeatLevelLeft].State().State
+			if targetLevel != m.numberEntities[EntityIDTargetHeatLevelRight].State().State {
+				if err := m.heatLevelEffect(ctx, controller.SideRight, targetLevel); err != nil {
+					return err
+				}
+
+				m.setNumber(EntityIDTargetHeatLevelRight, targetLevel)
+			}
+
+			heating := m.switchEntities[EntityIDHeatLeft].State().State
+			if heating != m.switchEntities[EntityIDHeatRight].State().State {
+				if err := m.heatSwitchEffect(ctx, controller.SideRight, heating); err != nil {
+					return err
+				}
+
+				m.setSwitch(EntityIDHeatRight, heating)
+			}
+		}
+
 		return nil
 	}})
 	// Numbers
