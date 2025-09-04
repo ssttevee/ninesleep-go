@@ -276,6 +276,13 @@ func (m *Manager) initNode(ctx context.Context) {
 	}
 
 	m.setBinary("pod_available", false)
+	m.pod.SetOnMitmBrightnessChange(func(brightness int) {
+		m.setNumber("led_brightness", float32(brightness))
+	})
+	m.pod.SetOnMitmConnected(func(connected bool) {
+		m.setBinary("upstream_connected", connected)
+	})
+	m.setSwitch("enable_upstream", m.pod.GetMitmMode())
 }
 
 func (m *Manager) runMDNS(ctx context.Context, apiCfg *api.Config) {
@@ -409,10 +416,12 @@ func (m *Manager) startHeatLoop(ctx context.Context, side controller.Side) (func
 // -------- Entity implementations --------
 
 type floatSensor struct {
-	ent   *entity.BaseEntity
-	st    state.State_[entity.SensorState]
-	unit  string
-	class entity.SensorDeviceClass
+	ent        *entity.BaseEntity
+	st         state.State_[entity.SensorState]
+	unit       string
+	stateclass entity.SensorStateClass
+	devclass   entity.SensorDeviceClass
+	decimals   int32
 }
 
 func (f *floatSensor) Setup()       {}
@@ -420,14 +429,14 @@ func (f *floatSensor) Close() error { return nil }
 func (f *floatSensor) InitializationPriority() component.InitializationPriority {
 	return component.InitializationPriorityBus
 }
-func (f *floatSensor) AccuracyDecimals() int32             { return 2 }
+func (f *floatSensor) AccuracyDecimals() int32             { return f.decimals }
 func (f *floatSensor) ForceUpdate() bool                   { return false }
-func (f *floatSensor) StateClass() entity.SensorStateClass { return entity.SensorStateClassMeasurement }
+func (f *floatSensor) StateClass() entity.SensorStateClass { return f.stateclass }
 func (f *floatSensor) LastResetType() entity.SensorLastResetType {
 	return entity.SensorLastResetTypeNone
 }
 func (f *floatSensor) UnitOfMeasurement() string             { return f.unit }
-func (f *floatSensor) DeviceClass() entity.SensorDeviceClass { return f.class }
+func (f *floatSensor) DeviceClass() entity.SensorDeviceClass { return f.devclass }
 func (f *floatSensor) Icon() string                          { return "" }
 func (f *floatSensor) State() entity.SensorState             { return f.st.State() }
 func (f *floatSensor) ID() string                            { return f.ent.ID() }
@@ -926,21 +935,26 @@ func (m *Manager) preRegisterEntities(ctx context.Context) {
 		m.disabledByDefault[id] = struct{}{}
 	}
 	// Float sensors
-	m.registerFloatSensor("heat_level_left", false, &floatSensor{unit: "lvl"})
-	m.registerFloatSensor("heat_level_right", false, &floatSensor{unit: "lvl"})
-	m.registerFloatSensor("heat_time_left_seconds", false, &floatSensor{unit: "s", class: entity.SensorDeviceClassDuration})
-	m.registerFloatSensor("heat_time_right_seconds", false, &floatSensor{unit: "s", class: entity.SensorDeviceClassDuration})
-	m.registerFloatSensor("pod_heartbeat_epoch", true, &floatSensor{unit: "s", class: entity.SensorDeviceClassTimestamp})
+	m.registerFloatSensor("heat_level_left", false, &floatSensor{unit: "lvl", stateclass: entity.SensorStateClassMeasurement})
+	m.registerFloatSensor("heat_level_right", false, &floatSensor{unit: "lvl", stateclass: entity.SensorStateClassMeasurement})
+	m.registerFloatSensor("heat_time_left_seconds", false, &floatSensor{unit: "s", stateclass: entity.SensorStateClassMeasurement, devclass: entity.SensorDeviceClassDuration})
+	m.registerFloatSensor("heat_time_right_seconds", false, &floatSensor{unit: "s", stateclass: entity.SensorStateClassMeasurement, devclass: entity.SensorDeviceClassDuration})
+	m.registerFloatSensor("pod_heartbeat_epoch", true, &floatSensor{unit: "s", stateclass: entity.SensorStateClassTotalIncreasing, devclass: entity.SensorDeviceClassTimestamp})
 	// Binary sensors
 	m.registerBinarySensor("water_level_ok", false, &binSensor{})
 	m.registerBinarySensor("priming_active", false, &binSensor{class: entity.BinarySensorDeviceClassRunning})
 	m.registerBinarySensor("pod_available", false, &binSensor{})
+	m.registerBinarySensor("upstream_connected", false, &binSensor{class: entity.BinarySensorDeviceClassRunning})
 	// Text sensors
 	m.registerTextSensor("sensor_label", true, &textSensor{})
 	m.registerTextSensor("settings_raw", true, &textSensor{})
 	// Switches
 	m.registerSwitchEntity("heat_left", false, &switchEntity{onSet: m.heatSwitchHandler(controller.SideLeft, &m.stopLeftHeating)})
 	m.registerSwitchEntity("heat_right", false, &switchEntity{onSet: m.heatSwitchHandler(controller.SideRight, &m.stopRightHeating)})
+	m.registerSwitchEntity("enable_upstream", false, &switchEntity{onSet: func(ctx context.Context, newState bool, current entity.SwitchState) error {
+		m.pod.SetMitmMode(newState)
+		return nil
+	}})
 	// Numbers
 	m.registerNumberEntity("target_heat_level_left", false, &numberEntity{
 		mode:     entity.NumberModeSlider,

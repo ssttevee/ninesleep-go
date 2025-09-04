@@ -184,6 +184,10 @@ func WithMITM(enabled bool) Option {
 type PodController struct {
 	mu sync.RWMutex
 
+	mitmConnected          bool
+	onMitmConnected        func(connected bool)
+	onMitmBrightnessChange func(brightness int)
+
 	conn        net.Conn
 	connected   bool
 	mitmMode    bool
@@ -216,6 +220,39 @@ func New(opts ...Option) *PodController {
 		o(p)
 	}
 	return p
+}
+
+func (p *PodController) GetMitmMode() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.mitmMode
+}
+func (p *PodController) SetMitmMode(enabled bool) {
+	p.mu.RLock()
+	if enabled == p.mitmMode {
+		p.mu.RUnlock()
+		return
+	}
+	p.mu.RUnlock()
+
+	p.mu.Lock()
+	p.mitmMode = enabled
+	p.mu.Unlock()
+
+	p.setConnection(nil)
+}
+
+func (p *PodController) SetOnMitmConnected(f func(connected bool)) {
+	p.mu.RLock()
+	p.onMitmConnected = f
+	connected := p.mitmConnected
+	p.mu.RUnlock()
+	f(connected)
+}
+
+func (p *PodController) SetOnMitmBrightnessChange(f func(brightness int)) {
+	p.onMitmBrightnessChange = f
 }
 
 func (p *PodController) WaitForConn() <-chan struct{} {
@@ -591,7 +628,6 @@ func (p *PodController) RunUnixSocketLoop(ctx context.Context) error {
 				return nil
 			case <-p.reconnectCh:
 			}
-			continue
 		}
 
 		if p.mitmMode {
@@ -643,6 +679,28 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 		return fmt.Errorf("dial upstream: %w", err)
 	}
 	defer upConn.Close()
+
+	{
+		p.mu.Lock()
+		p.mitmConnected = true
+		f := p.onMitmConnected
+		p.mu.Unlock()
+
+		if f != nil {
+			f(true)
+		}
+	}
+
+	defer func() {
+		p.mu.Lock()
+		p.mitmConnected = false
+		f := p.onMitmConnected
+		p.mu.Unlock()
+
+		if f != nil {
+			f(false)
+		}
+	}()
 
 	reader := bufio.NewReader(upConn)
 
@@ -714,6 +772,21 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 		// Log the MITM interaction.
 		if commandID != int(FrankenCommandPleaseSendVariables) {
 			log.Printf("[mitm] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(execErr))
+		}
+
+		if commandID == int(FrankenCommandSetSettings) && payloadHex != "" && p.onMitmBrightnessChange != nil {
+			if raw, err := hex.DecodeString(payloadHex); err != nil {
+				log.Printf("[mitm] settings decode hex error: %v", err)
+			} else {
+				var decoded map[string]any
+				if err := cbor.Unmarshal(raw, &decoded); err != nil {
+					log.Printf("[mitm] settings cbor unmarshal error: %v", err)
+				} else {
+					if v, ok := decoded["lb"]; ok {
+						p.onMitmBrightnessChange(int(v.(uint64)))
+					}
+				}
+			}
 		}
 	}
 }
