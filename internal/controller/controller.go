@@ -652,6 +652,10 @@ func (p *PodController) RunUnixSocketLoop(ctx context.Context) error {
 			}
 
 		} else {
+			if err := exec.Command("systemctl", "stop", "dac").Run(); err != nil {
+				log.Println("failed to stop dac service")
+			}
+
 			if err := p.reconnectFrankenNormal(true); err != nil {
 				if ctx.Err() != nil {
 					return nil
