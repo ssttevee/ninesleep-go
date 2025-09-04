@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"eightsleep-esphome/internal/controller"
+	"github.com/ssttevee/ninesleep-go/internal/controller"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/grandcat/zeroconf"

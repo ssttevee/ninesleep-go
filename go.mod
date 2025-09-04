@@ -1,4 +1,4 @@
-module eightsleep-esphome
+module github.com/ssttevee/ninesleep-go
 
 go 1.24
 
@@ -16,7 +16,7 @@ require github.com/x448/float16 v0.8.4 // indirect
 // additional interfaces like yaml.NodeUnmarshalerContext used in their code).
 replace github.com/goccy/go-yaml => github.com/gosthome/go-yaml v0.0.0-20250218092000-3492985ee5ed
 
-replace github.com/gosthome/gosthome => ../gosthome
+replace github.com/gosthome/gosthome => github.com/ssttevee/gosthome v0.0.0-20250904155447-dae257fe2874
 
 require (
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect

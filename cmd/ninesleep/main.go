@@ -9,9 +9,9 @@ import (
 	"syscall"
 	"time"
 
-	"eightsleep-esphome/internal/controller"
-	"eightsleep-esphome/internal/gost"
-	"eightsleep-esphome/internal/httpui"
+	"github.com/ssttevee/ninesleep-go/internal/controller"
+	"github.com/ssttevee/ninesleep-go/internal/gost"
+	"github.com/ssttevee/ninesleep-go/internal/httpui"
 )
 
 const (

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"eightsleep-esphome/internal/controller"
+	"github.com/ssttevee/ninesleep-go/internal/controller"
 )
 
 type Server struct {
