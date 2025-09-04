@@ -207,9 +207,6 @@ type PodController struct {
 	// from connected -> disconnected.
 	reconnectCh chan struct{}
 
-	// active (stored) unix listener for franken firmware
-	frankenLn net.Listener
-
 	// configuration
 	readTimeout  time.Duration
 	varCallbacks []VariablesCallback
@@ -309,11 +306,28 @@ func (p *PodController) waitForFranken() (net.Conn, error) {
 		return conn, nil
 	}
 
-	conn, err := p.frankenLn.Accept()
+	if err := os.Remove(DacSocketPath); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+
+	l, err := net.Listen("unix", DacSocketPath)
 	if err != nil {
 		return nil, err
 	}
+
+	if ul, ok := l.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(true)
+	}
+
+	conn, err = l.Accept()
+	if err != nil {
+		return nil, err
+	}
+
 	p.setConnection(conn)
+
 	return conn, nil
 }
 
@@ -568,65 +582,6 @@ func errorString(err error) string {
 	return err.Error()
 }
 
-// cleanupUnixSocket removes a pre-existing unix domain socket file.
-//
-// Mirrors the tryCleanup behavior in the original FrankenServer.start (TS) but is
-// exposed so callers can explicitly manage lifecycle when embedding the controller.
-func (p *PodController) cleanupUnixSocket(path string) error {
-	if err := os.Remove(path); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-// startUnixSocket creates (or recreates) the primary unix domain socket listener at DacSocketPath
-// and stores it in the controller. If a previous stored listener exists it is closed first.
-// The stored listener is used by RunUnixSocketLoop unless overridden during MITM injection.
-//
-// Concurrency:
-//   - Caller should NOT hold p.mu; this function acquires it internally only after
-//     the listener is successfully created.
-//   - Safe to call repeatedly; an existing different listener will be closed.
-//
-// Idempotency:
-//   - If the existing listener already listens on DacSocketPath it is replaced
-//     without error (the old one is closed).
-func (p *PodController) startUnixSocket() error {
-	if err := p.cleanupUnixSocket(DacSocketPath); err != nil {
-		return fmt.Errorf("cleanup socket: %w", err)
-	}
-	l, err := net.Listen("unix", DacSocketPath)
-	if err != nil {
-		return err
-	}
-	if ul, ok := l.(*net.UnixListener); ok {
-		ul.SetUnlinkOnClose(true)
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.frankenLn != nil && p.frankenLn != l {
-		_ = p.frankenLn.Close()
-	}
-	p.frankenLn = l
-	return nil
-}
-
-// stopUnixSocket closes the currently stored unix listener (if present) and
-// clears the reference so a later startUnixSocket or InjectMITM can recreate it.
-func (p *PodController) stopUnixSocket() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.frankenLn == nil {
-		return nil
-	}
-	err := p.frankenLn.Close()
-	p.frankenLn = nil
-	return err
-}
-
 // RunUnixSocketLoop ensures a unix socket listener exists and continuously
 // accepts firmware connections until the context is canceled.
 func (p *PodController) RunUnixSocketLoop(ctx context.Context) error {
@@ -634,6 +589,9 @@ func (p *PodController) RunUnixSocketLoop(ctx context.Context) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
+
+	var mu sync.Mutex
+	var killMitmLoop func()
 
 	for {
 		select {
@@ -651,48 +609,49 @@ func (p *PodController) RunUnixSocketLoop(ctx context.Context) error {
 			}
 		}
 
-		if p.mitmMode {
-			if err := p.reconnectFrankenMitm(ctx); err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
+		if err := exec.Command("systemctl", "stop", "dac").Run(); err != nil {
+			log.Println("failed to stop dac service", err)
+		}
 
-				return err
+		if _, err := p.waitForFranken(); err != nil {
+			return fmt.Errorf("wait for franken: %w", err)
+		}
+
+		p.mu.RLock()
+		mitm := p.mitmMode
+		p.mu.RUnlock()
+
+		mu.Lock()
+		kill := killMitmLoop
+		mu.Unlock()
+
+		if mitm {
+			if kill == nil {
+				go func() {
+					cctx, cancel := context.WithCancel(ctx)
+					defer cancel()
+
+					mu.Lock()
+					killMitmLoop = cancel
+					mu.Unlock()
+
+					defer func() {
+						mu.Lock()
+						killMitmLoop = nil
+						mu.Unlock()
+					}()
+
+					p.runMitmLoop(cctx)
+				}()
 			}
+		} else if kill != nil {
+			kill()
+		}
 
-		} else {
-			if err := exec.Command("systemctl", "stop", "dac").Run(); err != nil {
-				log.Println("failed to stop dac service")
-			}
-
-			if err := p.reconnectFrankenNormal(true); err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
-
-				return err
-			}
+		if err := exec.Command("systemctl", "start", "dac").Run(); err != nil {
+			log.Println("failed to start dac service", err)
 		}
 	}
-}
-
-func (p *PodController) reconnectFrankenNormal(reuse bool) error {
-	p.mu.RLock()
-	ln := p.frankenLn
-	p.mu.RUnlock()
-
-	if ln == nil || !reuse {
-		if err := p.startUnixSocket(); err != nil {
-			return fmt.Errorf("start unix socket: %w", err)
-		}
-	}
-
-	// Accept firmware connection.
-	if _, err := p.waitForFranken(); err != nil {
-		return fmt.Errorf("wait for franken: %w", err)
-	}
-
-	return nil
 }
 
 // mitmConnectAndForward connects to the original (renamed) dac socket and
@@ -803,67 +762,6 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 			p.onMitmRequest(FrankenCommand(commandID), payloadHex)
 		}
 	}
-}
-
-// reconnectFrankenMitm performs ephemeral MITM setup. After completion the controller
-// proxies commands between the firmware (captured via a temporary intercept socket) and
-// the first‑party process which continues to own dac.sock. We do NOT keep dac.sock bound;
-// if this process exits the system keeps working normally.
-//
-// Ephemeral flow (crash‑safe):
-//  1. systemctl stop dac
-//  2. Create a temporary intercept socket and accept a firmware (franken) connection
-//  3. Close (unbind) the temporary intercept socket so dac can recreate dac.sock
-//  4. systemctl start dac
-//  5. Once dac.sock is recreated, begin MITM forwarding (background goroutine)
-//
-// Re‑injection:
-//   - If the firmware disconnects, this can be invoked again.
-//   - Because dac.sock is not held long‑term, crashes revert cleanly to native behavior.
-//
-// Returns after initial setup; forwarding continues in a background goroutine.
-func (p *PodController) reconnectFrankenMitm(ctx context.Context) error {
-	logStep := func(step, msg string, err error) {
-		if err != nil {
-			log.Printf("[mitm-inject] step=%s msg=%s err=%s", step, msg, errorString(err))
-		} else {
-			log.Printf("[mitm-inject] step=%s %s", step, msg)
-		}
-	}
-
-	// Step 1: stop dac service.
-	if err := exec.Command("systemctl", "stop", "dac").Run(); err != nil {
-		logStep("stop", "systemctl stop dac", err)
-		return fmt.Errorf("stop dac: %w", err)
-	}
-	logStep("stop", "dac stopped", nil)
-
-	// Step 2: start temporary intercept socket to capture firmware connection.
-	if err := p.reconnectFrankenNormal(false); err != nil {
-		logStep("start-listener-initial", "start intercept socket", err)
-		return fmt.Errorf("start initial socket: %w", err)
-	}
-	logStep("start-listener-initial", "intercept listener started", nil)
-
-	// Step 3: unbind (close) our temporary listener (SetUnlinkOnClose will remove the path).
-	if err := p.stopUnixSocket(); err != nil {
-		logStep("unbind-initial", "close initial listener", err)
-		return fmt.Errorf("close initial listener: %w", err)
-	}
-	logStep("unbind-initial", "initial listener closed", nil)
-
-	// Step 4: restart dac service so it recreates dac.sock.
-	if err := exec.Command("systemctl", "start", "dac").Run(); err != nil {
-		logStep("start-dac", "systemctl start dac", err)
-		return fmt.Errorf("start dac: %w", err)
-	}
-	logStep("start-dac", "dac started", nil)
-
-	// Step 5: start forwarding loop (connect to dac.sock as a client) in background.
-	go p.runMitmLoop(ctx)
-
-	logStep("complete", "MITM injection complete", nil)
-	return nil
 }
 
 func (p *PodController) runMitmLoop(ctx context.Context) {
