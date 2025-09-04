@@ -33,6 +33,31 @@ import (
 	_ "github.com/gosthome/gosthome/components" // register default components
 )
 
+// Entity & Sensor ID constants
+const (
+	EntityIDPodAvailable         = "pod_available"
+	EntityIDCloudConnected       = "cloud_connected"
+	EntityIDEnableCloud          = "enable_cloud"
+	EntityIDHeatLeft             = "heat_left"
+	EntityIDHeatRight            = "heat_right"
+	EntityIDHeatLevelLeft        = "heat_level_left"
+	EntityIDHeatLevelRight       = "heat_level_right"
+	EntityIDHeatTimeLeftSeconds  = "heat_time_left_seconds"
+	EntityIDHeatTimeRightSeconds = "heat_time_right_seconds"
+	EntityIDTargetHeatLevelLeft  = "target_heat_level_left"
+	EntityIDTargetHeatLevelRight = "target_heat_level_right"
+	EntityIDLedBrightness        = "led_brightness"
+	EntityIDWaterLevelOK         = "water_level_ok"
+	EntityIDPrimingActive        = "priming_active"
+	EntityIDSensorLabel          = "sensor_label"
+	EntityIDSettingsRaw          = "settings_raw"
+	EntityIDPodHeartbeatEpoch    = "pod_heartbeat_epoch"
+	EntityIDPrimeButton          = "prime"
+	EntityIDFirmwareResetButton  = "firmware_reset"
+	EntityIDPowerResetButton     = "power_reset"
+	EntityIDFactoryResetButton   = "factory_reset"
+)
+
 // Manager owns the gosthome (ESPHome native API) node and registered entities.
 type Manager struct {
 	mu sync.RWMutex
@@ -276,7 +301,7 @@ func (m *Manager) initNode(ctx context.Context) {
 		go m.runMDNS(ctx, apiCfg)
 	}
 
-	m.setBinary("pod_available", false)
+	m.setBinary(EntityIDPodAvailable, false)
 	m.pod.SetOnMitmRequest(func(command controller.FrankenCommand, payload string) {
 		switch command {
 		case controller.FrankenCommandSetSettings:
@@ -286,7 +311,7 @@ func (m *Manager) initNode(ctx context.Context) {
 					if err := cbor.Unmarshal(raw, &decoded); err == nil {
 						if v, ok := decoded["lb"]; ok {
 							if lb, ok := v.(uint64); ok {
-								m.setNumber("led_brightness", float32(lb))
+								m.setNumber(EntityIDLedBrightness, float32(lb))
 							}
 						}
 					}
@@ -295,29 +320,29 @@ func (m *Manager) initNode(ctx context.Context) {
 
 		case controller.FrankenCommandHeatLeft:
 			if n, err := strconv.Atoi(payload); err == nil {
-				m.setNumber("heat_time_left_seconds", float32(n))
+				m.setNumber(EntityIDHeatTimeLeftSeconds, float32(n))
 			}
 
 		case controller.FrankenCommandHeatRight:
 			if n, err := strconv.Atoi(payload); err == nil {
-				m.setNumber("heat_time_right_seconds", float32(n))
+				m.setNumber(EntityIDHeatTimeRightSeconds, float32(n))
 			}
 
 		case controller.FrankenCommandLevelLeft:
 			if n, err := strconv.Atoi(payload); err == nil {
-				m.setNumber("target_heat_level_left", float32(n))
+				m.setNumber(EntityIDTargetHeatLevelLeft, float32(n))
 			}
 
 		case controller.FrankenCommandLevelRight:
 			if n, err := strconv.Atoi(payload); err == nil {
-				m.setNumber("target_heat_level_right", float32(n))
+				m.setNumber(EntityIDTargetHeatLevelRight, float32(n))
 			}
 		}
 	})
 	m.pod.SetOnMitmConnected(func(connected bool) {
-		m.setBinary("cloud_connected", connected)
+		m.setBinary(EntityIDCloudConnected, connected)
 	})
-	m.setSwitch("enable_cloud", m.pod.GetMitmMode())
+	m.setSwitch(EntityIDEnableCloud, m.pod.GetMitmMode())
 }
 
 func (m *Manager) runMDNS(ctx context.Context, apiCfg *api.Config) {
@@ -370,7 +395,7 @@ func (m *Manager) pollOnce() {
 	now := time.Now()
 	if err != nil {
 		// heartbeat sensor still updated
-		m.setFloat("pod_heartbeat_epoch", float32(now.Unix()))
+		m.setFloat(EntityIDPodHeartbeatEpoch, float32(now.Unix()))
 		m.updateAvailability()
 		return
 	}
@@ -385,26 +410,26 @@ func (m *Manager) updateFromParsed() {
 		return
 	}
 	// Numeric
-	m.setNumber("led_brightness", float32(pv.LedBrightness))
-	m.setNumber("target_heat_level_left", float32(pv.TargetHeatLevelL))
-	m.setNumber("target_heat_level_right", float32(pv.TargetHeatLevelR))
-	m.setFloat("heat_level_left", float32(pv.HeatLevelL))
-	m.setFloat("heat_level_right", float32(pv.HeatLevelR))
-	m.setFloat("heat_time_left_seconds", float32(pv.HeatTimeL))
-	m.setFloat("heat_time_right_seconds", float32(pv.HeatTimeR))
-	m.setSwitch("heat_left", pv.HeatTimeL > 0)
-	m.setSwitch("heat_right", pv.HeatTimeR > 0)
+	m.setNumber(EntityIDLedBrightness, float32(pv.LedBrightness))
+	m.setNumber(EntityIDTargetHeatLevelLeft, float32(pv.TargetHeatLevelL))
+	m.setNumber(EntityIDTargetHeatLevelRight, float32(pv.TargetHeatLevelR))
+	m.setFloat(EntityIDHeatLevelLeft, float32(pv.HeatLevelL))
+	m.setFloat(EntityIDHeatLevelRight, float32(pv.HeatLevelR))
+	m.setFloat(EntityIDHeatTimeLeftSeconds, float32(pv.HeatTimeL))
+	m.setFloat(EntityIDHeatTimeRightSeconds, float32(pv.HeatTimeR))
+	m.setSwitch(EntityIDHeatLeft, pv.HeatTimeL > 0)
+	m.setSwitch(EntityIDHeatRight, pv.HeatTimeR > 0)
 
 	// Binary
-	m.setBinary("water_level_ok", pv.WaterLevel)
-	m.setBinary("priming_active", pv.Priming)
+	m.setBinary(EntityIDWaterLevelOK, pv.WaterLevel)
+	m.setBinary(EntityIDPrimingActive, pv.Priming)
 
 	// Text
-	m.setText("sensor_label", pv.SensorLabel)
-	m.setText("settings_raw", pv.SettingsRaw)
+	m.setText(EntityIDSensorLabel, pv.SensorLabel)
+	m.setText(EntityIDSettingsRaw, pv.SettingsRaw)
 
 	// Heartbeat (fast path)
-	m.setFloat("pod_heartbeat_epoch", float32(time.Now().Unix()))
+	m.setFloat(EntityIDPodHeartbeatEpoch, float32(time.Now().Unix()))
 }
 
 func (m *Manager) updateAvailability() {
@@ -413,7 +438,7 @@ func (m *Manager) updateAvailability() {
 	if !m.lastPollSuccess.IsZero() {
 		ok = time.Since(m.lastPollSuccess) <= 2*m.pollEvery+grace
 	}
-	m.setBinary("pod_available", ok)
+	m.setBinary(EntityIDPodAvailable, ok)
 }
 
 const heatLoopSeconds = 21600
@@ -962,32 +987,32 @@ func (m *Manager) preRegisterEntities(ctx context.Context) {
 		m.disabledByDefault = map[string]struct{}{}
 	}
 	// Mark disabled sensors
-	for _, id := range []string{"sensor_label", "settings_raw", "pod_heartbeat_epoch"} {
+	for _, id := range []string{EntityIDSensorLabel, EntityIDSettingsRaw, EntityIDPodHeartbeatEpoch} {
 		m.disabledByDefault[id] = struct{}{}
 	}
 	// Float sensors
-	m.registerFloatSensor("heat_level_left", false, &floatSensor{unit: "lvl", stateclass: entity.SensorStateClassMeasurement})
-	m.registerFloatSensor("heat_level_right", false, &floatSensor{unit: "lvl", stateclass: entity.SensorStateClassMeasurement})
-	m.registerFloatSensor("heat_time_left_seconds", false, &floatSensor{unit: "s", stateclass: entity.SensorStateClassMeasurement, devclass: entity.SensorDeviceClassDuration})
-	m.registerFloatSensor("heat_time_right_seconds", false, &floatSensor{unit: "s", stateclass: entity.SensorStateClassMeasurement, devclass: entity.SensorDeviceClassDuration})
-	m.registerFloatSensor("pod_heartbeat_epoch", true, &floatSensor{unit: "s", stateclass: entity.SensorStateClassTotalIncreasing, devclass: entity.SensorDeviceClassTimestamp})
+	m.registerFloatSensor(EntityIDHeatLevelLeft, false, &floatSensor{unit: "lvl", stateclass: entity.SensorStateClassMeasurement})
+	m.registerFloatSensor(EntityIDHeatLevelRight, false, &floatSensor{unit: "lvl", stateclass: entity.SensorStateClassMeasurement})
+	m.registerFloatSensor(EntityIDHeatTimeLeftSeconds, false, &floatSensor{unit: "s", stateclass: entity.SensorStateClassMeasurement, devclass: entity.SensorDeviceClassDuration})
+	m.registerFloatSensor(EntityIDHeatTimeRightSeconds, false, &floatSensor{unit: "s", stateclass: entity.SensorStateClassMeasurement, devclass: entity.SensorDeviceClassDuration})
+	m.registerFloatSensor(EntityIDPodHeartbeatEpoch, true, &floatSensor{unit: "s", stateclass: entity.SensorStateClassTotalIncreasing, devclass: entity.SensorDeviceClassTimestamp})
 	// Binary sensors
-	m.registerBinarySensor("water_level_ok", false, &binSensor{})
-	m.registerBinarySensor("priming_active", false, &binSensor{class: entity.BinarySensorDeviceClassRunning})
-	m.registerBinarySensor("pod_available", false, &binSensor{})
-	m.registerBinarySensor("cloud_connected", false, &binSensor{class: entity.BinarySensorDeviceClassRunning})
+	m.registerBinarySensor(EntityIDWaterLevelOK, false, &binSensor{})
+	m.registerBinarySensor(EntityIDPrimingActive, false, &binSensor{class: entity.BinarySensorDeviceClassRunning})
+	m.registerBinarySensor(EntityIDPodAvailable, false, &binSensor{})
+	m.registerBinarySensor(EntityIDCloudConnected, false, &binSensor{class: entity.BinarySensorDeviceClassRunning})
 	// Text sensors
-	m.registerTextSensor("sensor_label", true, &textSensor{})
-	m.registerTextSensor("settings_raw", true, &textSensor{})
+	m.registerTextSensor(EntityIDSensorLabel, true, &textSensor{})
+	m.registerTextSensor(EntityIDSettingsRaw, true, &textSensor{})
 	// Switches
-	m.registerSwitchEntity("heat_left", false, &switchEntity{onSet: m.heatSwitchHandler(controller.SideLeft, &m.stopLeftHeating)})
-	m.registerSwitchEntity("heat_right", false, &switchEntity{onSet: m.heatSwitchHandler(controller.SideRight, &m.stopRightHeating)})
-	m.registerSwitchEntity("enable_cloud", false, &switchEntity{onSet: func(ctx context.Context, newState bool, current entity.SwitchState) error {
+	m.registerSwitchEntity(EntityIDHeatLeft, false, &switchEntity{onSet: m.heatSwitchHandler(controller.SideLeft, &m.stopLeftHeating)})
+	m.registerSwitchEntity(EntityIDHeatRight, false, &switchEntity{onSet: m.heatSwitchHandler(controller.SideRight, &m.stopRightHeating)})
+	m.registerSwitchEntity(EntityIDEnableCloud, false, &switchEntity{onSet: func(ctx context.Context, newState bool, current entity.SwitchState) error {
 		m.pod.SetMitmMode(newState)
 		return nil
 	}})
 	// Numbers
-	m.registerNumberEntity("target_heat_level_left", false, &numberEntity{
+	m.registerNumberEntity(EntityIDTargetHeatLevelLeft, false, &numberEntity{
 		mode:     entity.NumberModeSlider,
 		unit:     "lvl",
 		minValue: -100,
@@ -995,7 +1020,7 @@ func (m *Manager) preRegisterEntities(ctx context.Context) {
 		step:     1,
 		onSet:    m.heatLevelHandler(controller.SideLeft),
 	})
-	m.registerNumberEntity("target_heat_level_right", false, &numberEntity{
+	m.registerNumberEntity(EntityIDTargetHeatLevelRight, false, &numberEntity{
 		mode:     entity.NumberModeSlider,
 		unit:     "lvl",
 		minValue: -100,
@@ -1003,7 +1028,7 @@ func (m *Manager) preRegisterEntities(ctx context.Context) {
 		step:     1,
 		onSet:    m.heatLevelHandler(controller.SideRight),
 	})
-	m.registerNumberEntity("led_brightness", false, &numberEntity{
+	m.registerNumberEntity(EntityIDLedBrightness, false, &numberEntity{
 		mode:     entity.NumberModeSlider,
 		unit:     "%",
 		minValue: 0,
@@ -1015,19 +1040,19 @@ func (m *Manager) preRegisterEntities(ctx context.Context) {
 		},
 	})
 	// Buttons
-	m.registerButtonEntity("prime", false, &buttonEntity{onPress: func() error {
+	m.registerButtonEntity(EntityIDPrimeButton, false, &buttonEntity{onPress: func() error {
 		_, err := m.pod.ExecuteFranken(controller.FrankenCommandPrime, "")
 		return err
 	}})
-	m.registerButtonEntity("firmware_reset", true, &buttonEntity{onPress: func() error {
+	m.registerButtonEntity(EntityIDFirmwareResetButton, true, &buttonEntity{onPress: func() error {
 		_, err := m.pod.ExecuteFranken(controller.FrankenCommandReset, "")
 		return err
 	}})
-	m.registerButtonEntity("power_reset", true, &buttonEntity{onPress: func() error {
+	m.registerButtonEntity(EntityIDPowerResetButton, true, &buttonEntity{onPress: func() error {
 		_, err := m.pod.ExecuteFranken(controller.FrankenCommandForceReset, "")
 		return err
 	}})
-	m.registerButtonEntity("factory_reset", true, &buttonEntity{onPress: func() error {
+	m.registerButtonEntity(EntityIDFactoryResetButton, true, &buttonEntity{onPress: func() error {
 		_, err := m.pod.ExecuteFranken(controller.FrankenCommandFormat, "")
 		return err
 	}})
