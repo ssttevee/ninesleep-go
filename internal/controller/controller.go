@@ -113,9 +113,9 @@ func SideFromString(s string) (Side, error) {
 func (s Side) String() string {
 	switch s {
 	case SideLeft:
-		return "LEFT"
+		return "left"
 	case SideRight:
-		return "RIGHT"
+		return "right"
 	default:
 		return fmt.Sprintf("UNKNOWN_SIDE_%d", int(s))
 	}
