@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -731,6 +732,8 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 			return fmt.Errorf("read command line: %w", err)
 		}
 
+		cmdLine = cmdLine[:len(cmdLine)-1]
+
 		commandID, err := strconv.Atoi(cmdLine)
 		if err != nil {
 			slog.Warn("[mitm] invalid command id", "line", cmdLine)
@@ -745,9 +748,8 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 			return fmt.Errorf("read payload line: %w", err)
 		}
 
-		payloadHex := ""
+		payloadLine = payloadLine[:len(payloadLine)-1]
 		if payloadLine != "" {
-			payloadHex = payloadLine
 			// Consume the required terminating blank line if present (ignore errors/timeouts).
 			if term, terr := reader.ReadString('\n'); terr == nil {
 				_ = term
@@ -757,7 +759,7 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 			// nothing more to consume.
 		}
 
-		resp, err := p.ExecuteRaw(ctx, commandID, payloadHex)
+		resp, err := p.ExecuteRaw(ctx, commandID, payloadLine)
 		if err != nil {
 			return err
 		}
@@ -768,11 +770,11 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 
 		// Log the MITM interaction.
 		if commandID != int(FrankenCommandPleaseSendVariables) {
-			slog.Info("[mitm] cmd", "cmd", commandID, "payload", payloadHex, "resp_len", len(resp))
+			slog.Info("[mitm] cmd", "cmd", commandID, "payload", payloadLine, "resp_len", len(resp))
 		}
 
 		if p.onMitmRequest != nil {
-			p.onMitmRequest(FrankenCommand(commandID), payloadHex)
+			p.onMitmRequest(FrankenCommand(commandID), payloadLine)
 		}
 	}
 }
@@ -801,7 +803,7 @@ func (p *PodController) runMitmLoop() {
 	for {
 		if err := p.mitmConnectAndForward(ctx); err != nil {
 			if ctx.Err() != nil {
-				log.Printf("[mitm-loop] context canceled, stopping")
+				slog.Info("[mitm-loop] context canceled")
 				return
 			}
 
@@ -810,7 +812,22 @@ func (p *PodController) runMitmLoop() {
 				continue
 			}
 
-			log.Printf("[mitm-loop] error: %v", err)
+			slog.Warn("[mitm-loop]", "err", err)
+
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				slog.Info("[mitm-loop] attempting to delete socket and restart dac service")
+
+				if err := os.Remove(DacSocketPath); err != nil {
+					if !os.IsNotExist(err) {
+						slog.Warn("[mitm-loop] failed to delete socket", "err", err)
+					}
+				}
+
+				if err := exec.Command("systemctl", "restart", "dac").Run(); err != nil {
+					slog.Warn("[mitm-loop] failed to restart dac service", "err", err)
+				}
+			}
+
 			time.Sleep(5 * time.Second)
 		}
 	}

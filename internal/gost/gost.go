@@ -473,17 +473,24 @@ func (m *Manager) updateFromParsed(ctx context.Context, pv *controller.PodVariab
 const heatLoopSeconds = 21600
 
 func (m *Manager) startHeatLoop(ctx context.Context, side controller.Side) (func() error, error) {
-	ctx, cancel := context.WithCancel(ctx)
+	if err := m.pod.ExecuteHeatDuration(ctx, side, heatLoopSeconds); err != nil {
+		return nil, err
+	}
+
+	m.setFloat(fmt.Sprintf("heat_time_%s_seconds", side), heatLoopSeconds)
+
+	cctx, cancel := context.WithCancel(ctx)
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-cctx.Done():
+				slog.Info("[heat-loop] context canceled")
 				return
 			case <-time.After(time.Hour):
 			}
 
-			if err := m.pod.ExecuteHeatDuration(ctx, side, heatLoopSeconds); err != nil {
-				slog.Error("failed to execute heat duration: %v", "err", err)
+			if err := m.pod.ExecuteHeatDuration(cctx, side, heatLoopSeconds); err != nil {
+				slog.Error("[heat-loop] failed to execute heat duration: %v", "err", err)
 			}
 
 			m.setFloat(fmt.Sprintf("heat_time_%s_seconds", side), heatLoopSeconds)
@@ -494,8 +501,14 @@ func (m *Manager) startHeatLoop(ctx context.Context, side controller.Side) (func
 	return func() error {
 		cancel()
 
-		return m.pod.ExecuteHeatDuration(ctx, side, 0)
-	}, m.pod.ExecuteHeatDuration(ctx, side, heatLoopSeconds)
+		if err := m.pod.ExecuteHeatDuration(ctx, side, 0); err != nil {
+			return err
+		}
+
+		m.setFloat(fmt.Sprintf("heat_time_%s_seconds", side), 0)
+
+		return nil
+	}, nil
 }
 
 // -------- Entity implementations --------
