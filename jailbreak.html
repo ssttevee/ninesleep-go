@@ -1,0 +1,1508 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <title>Eight Sleep Pod RootFS Patch Tool (Steps 2–10)</title>
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <meta
+            name="description"
+            content="Stream, patch, and repackage Eight Sleep Pod rootfs.tar.gz in-browser (steps 2–10 of jailbreak)."
+        />
+        <style>
+            :root {
+                color-scheme: light dark;
+                --bg: #0d0f12;
+                --panel: #1e2430;
+                --border: #3a4658;
+                --accent: #0a6cff;
+                --accent-hover: #1b7dff;
+                --danger: #d53939;
+                --ok: #1f9e49;
+                --warn: #c97c00;
+                font-family:
+                    system-ui,
+                    -apple-system,
+                    Segoe UI,
+                    Roboto,
+                    Ubuntu,
+                    "Helvetica Neue",
+                    Arial,
+                    sans-serif;
+            }
+            body {
+                margin: 1rem auto 3rem;
+                max-width: 1120px;
+                line-height: 1.45;
+                padding: 0 1rem;
+            }
+            h1 {
+                margin-top: 0;
+                line-height: 1.15;
+            }
+            h2 {
+                margin-top: 2.25rem;
+            }
+            fieldset {
+                margin: 0 0 1.15rem;
+                padding: 0.85rem 1rem 1.2rem;
+                border: 1px solid var(--border);
+                border-radius: 8px;
+                background: linear-gradient(180deg, #ffffff08, #ffffff05);
+            }
+            legend {
+                padding: 0 0.5rem;
+                font-weight: 600;
+            }
+            label {
+                display: flex;
+                flex-direction: column;
+                gap: 0.4rem;
+                margin-bottom: 0.9rem;
+                font-weight: 600;
+            }
+            input[type="text"],
+            input[type="password"],
+            input[type="number"] {
+                font: inherit;
+                padding: 0.55rem 0.65rem;
+                border: 1px solid var(--border);
+                border-radius: 5px;
+                background: var(--panel);
+                color: inherit;
+                outline: none;
+            }
+            input[type="text"]:focus,
+            input[type="password"]:focus,
+            input[type="number"]:focus {
+                border-color: var(--accent);
+                box-shadow: 0 0 0 1px var(--accent);
+            }
+            input[type="file"] {
+                font: inherit;
+            }
+            button {
+                font:
+                    600 0.95rem/1 system-ui,
+                    -apple-system,
+                    Segoe UI,
+                    Roboto,
+                    Ubuntu,
+                    sans-serif;
+                padding: 0.65rem 1.2rem;
+                border-radius: 5px;
+                border: 1px solid var(--accent);
+                background: var(--accent);
+                color: #fff;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                gap: 0.5rem;
+                letter-spacing: 0.25px;
+            }
+            button:hover:not(:disabled) {
+                background: var(--accent-hover);
+            }
+            button.secondary {
+                background: #374251;
+                border-color: #4b5a6e;
+            }
+            button.secondary:hover:not(:disabled) {
+                background: #465467;
+            }
+            button:disabled {
+                opacity: 0.55;
+                cursor: not-allowed;
+            }
+            #advanced {
+                display: none;
+            }
+            #advanced.visible {
+                display: block;
+                animation: fade 0.25s;
+            }
+            @keyframes fade {
+                from {
+                    opacity: 0;
+                    transform: translateY(-4px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+            #logs {
+                font-family:
+                    ui-monospace, SFMono-Regular, Menlo, Consolas,
+                    "Liberation Mono", monospace;
+                font-size: 0.78rem;
+                white-space: pre-wrap;
+                background: #111a22;
+                color: #d6e2ef;
+                padding: 0.85rem 0.9rem;
+                border-radius: 8px;
+                height: 300px;
+                overflow: auto;
+                border: 1px solid var(--border);
+            }
+            #logs .warn {
+                color: var(--warn);
+            }
+            #logs .err {
+                color: var(--danger);
+            }
+            #logs .ok {
+                color: var(--ok);
+            }
+            .hint {
+                font-weight: 400;
+                font-size: 0.72rem;
+                opacity: 0.75;
+                letter-spacing: 0.25px;
+            }
+            .badge {
+                display: inline-block;
+                padding: 4px 8px;
+                font-size: 0.65rem;
+                letter-spacing: 0.6px;
+                text-transform: uppercase;
+                background: #303b49;
+                color: #fff;
+                border-radius: 4px;
+            }
+            .inline {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.55rem;
+                font-weight: 600;
+            }
+            #startRow {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 1rem;
+                margin-top: 0.25rem;
+            }
+            progress {
+                flex-grow: 1;
+                max-width: 100%;
+                height: 1rem;
+            }
+            code {
+                background: #1d2833;
+                padding: 2px 5px;
+                border-radius: 4px;
+                font-size: 0.85em;
+            }
+            .two-col {
+                display: flex;
+                gap: 1.2rem;
+                flex-wrap: wrap;
+            }
+            .two-col > div {
+                flex: 1 1 260px;
+            }
+            a {
+                color: var(--accent);
+                text-decoration: none;
+            }
+            a:hover {
+                text-decoration: underline;
+            }
+            .divider {
+                margin: 1.75rem 0 1.5rem;
+                height: 1px;
+                background: linear-gradient(90deg, #0000, #3a4658, #0000);
+                border: 0;
+            }
+            .status-pair {
+                display: flex;
+                gap: 0.5rem;
+                align-items: center;
+            }
+            .sr-only {
+                position: absolute;
+                left: -9999px;
+            }
+            .pad-top {
+                padding-top: 0.35rem;
+            }
+            footer {
+                margin-top: 3rem;
+                font-size: 0.7rem;
+                opacity: 0.55;
+                text-align: center;
+            }
+            body {
+                background: var(--bg);
+                color: #d7e2f1;
+            }
+            fieldset {
+                background: #18202a;
+            }
+            input,
+            button {
+                transition: 0.15s;
+            }
+        </style>
+
+        <!-- Import map stub for "crypto" (bcryptjs expects Node-like crypto in some contexts) -->
+        <script type="importmap">
+            {
+                "imports": {
+                    "crypto": "data:text/javascript,export%20function%20randomFillSync(arr){if(!(arr%20instanceof%20Uint8Array))throw%20new%20TypeError('Uint8Array');self.crypto.getRandomValues(arr);return%20arr;}export%20function%20randomBytes(n){const%20b=new%20Uint8Array(n);self.crypto.getRandomValues(b);return%20b;}export%20default%20{};"
+                }
+            }
+        </script>
+    </head>
+    <body>
+        <h1>Eight Sleep Pod RootFS Patch Tool</h1>
+        <p>
+            This page performs the
+            <a
+                href="https://github.com/ssttevee/ninesleep-go?tab=readme-ov-file#jailbreaking"
+                >jailbreak modification steps (2–10)</a
+            >
+            fully in your browser:
+        </p>
+        <ul>
+            <li>Inserts ninesleep-go binary and service files</li>
+            <li>Enables the ninesleep service to run on power on</li>
+            <li>Masks/disables the swupdate service</li>
+            <li>Removes Eight Sleep's ssh keys</li>
+            <li>Optionally preconfigures the wifi connection</li>
+            <li>Optionally inserts custom ssh keys</li>
+            <li>Optionally sets the root password for sudo/su</li>
+        </ul>
+
+        <form id="patchForm" autocomplete="off">
+            <fieldset>
+                <legend>Input RootFS</legend>
+                <label>
+                    <div>
+                        Original
+                        <code>rootfs.tar.gz</code>
+                    </div>
+                    <input
+                        id="rootfsFile"
+                        type="file"
+                        accept=".gz,application/gzip"
+                        required
+                    />
+                    <span class="hint"
+                        >File is processed 100% locally and never
+                        uploaded.</span
+                    >
+                </label>
+            </fieldset>
+
+            <fieldset>
+                <legend>Wi-Fi (Optional)</legend>
+                <div class="inline">
+                    <input id="wifiEnable" type="checkbox" />
+                    <label for="wifiEnable" style="margin: 0; font-weight: 600"
+                        >Generate NetworkManager connection file</label
+                    >
+                </div>
+                <div id="wifiFields" style="display: none; margin-top: 0.75rem">
+                    <div class="two-col">
+                        <div>
+                            <label
+                                >SSID
+                                <input
+                                    id="wifiSsid"
+                                    type="text"
+                                    placeholder="WIFI_NAME"
+                                />
+                            </label>
+                        </div>
+                        <div>
+                            <label
+                                >Password
+                                <input
+                                    id="wifiPsk"
+                                    type="text"
+                                    placeholder="WIFI_PASSWORD"
+                                />
+                            </label>
+                        </div>
+                    </div>
+                    <span class="hint"
+                        >Writes
+                        <code
+                            >/etc/NetworkManager/system-connections/customer-wifi.nmconnection</code
+                        >
+                        (0600).</span
+                    >
+                </div>
+            </fieldset>
+
+            <fieldset>
+                <legend>SSH Authorized Keys (Optional)</legend>
+                <label>
+                    Public keys (one per line)
+                    <textarea
+                        id="sshKeys"
+                        style="
+                            min-height: 120px;
+                            resize: vertical;
+                            font-family: ui-monospace, monospace;
+                            font-size: 0.75rem;
+                            padding: 0.5rem;
+                            border: 1px solid var(--border);
+                            border-radius: 5px;
+                            background: var(--panel);
+                            color: inherit;
+                        "
+                    ></textarea>
+                    <span class="hint"
+                        >If provided, you can use them to ssh into your pod on
+                        port <code>8822</code> as the
+                        <code>rewt</code> user.</span
+                    >
+                </label>
+            </fieldset>
+
+            <fieldset>
+                <legend>Root Password (Optional)</legend>
+                <label>
+                    New root password
+                    <input
+                        id="rootPassword"
+                        type="password"
+                        autocomplete="new-password"
+                    />
+                    <span class="hint"
+                        >If provided, the <code>root</code> entry in
+                        <code>/etc/shadow</code> will be set so you can
+                        sudo/su.</span
+                    >
+                </label>
+            </fieldset>
+
+            <button type="button" id="toggleAdvanced" class="secondary">
+                Show Advanced Settings
+            </button>
+            <div id="advanced" class="pad-top">
+                <fieldset>
+                    <legend>Advanced Settings</legend>
+                    <div class="two-col">
+                        <div>
+                            <label>Release tag or custom binary </label>
+                            <div style="display: flex; gap: 1.25rem">
+                                <select id="ninesleepVersion">
+                                    <option>custom</option>
+                                    <option selected>v0.0.0</option>
+                                </select>
+                                <input id="customBinary" type="file" />
+                            </div>
+                        </div>
+                        <div>
+                            <label
+                                >Bcrypt cost (log2 rounds)
+                                <input
+                                    id="bcryptCost"
+                                    type="number"
+                                    min="4"
+                                    max="15"
+                                    value="10"
+                                />
+                                <span class="hint"
+                                    >Higher = slower/stronger. Default 10.</span
+                                >
+                            </label>
+                        </div>
+                    </div>
+                    <div class="two-col pad-top">
+                        <div>
+                            <div>
+                                <div class="inline">
+                                    <input id="addWebUI" type="checkbox" />
+                                    <label for="addWebUI" style="margin: 0"
+                                        >Enable test web interface</label
+                                    >
+                                </div>
+                            </div>
+                            <span class="hint"
+                                >Can be used to send arbitrary commands to the
+                                device on port <code>8080</code></span
+                            >
+                        </div>
+                        <div>
+                            <div>
+                                <div class="inline">
+                                    <input id="disableCloud" type="checkbox" />
+                                    <label for="disableCloud" style="margin: 0"
+                                        >Disable cloud/app by default</label
+                                    >
+                                </div>
+                            </div>
+                            <span class="hint"
+                                >It can still be turned back on from Home
+                                Assistant</span
+                            >
+                        </div>
+                    </div>
+                </fieldset>
+            </div>
+
+            <div style="margin-top: 1.15rem">
+                <button id="startBtn" type="submit">Start Patch</button>
+            </div>
+
+            <div id="startRow" style="display: flex; margin-top: 1.15rem">
+                <div class="status-pair">
+                    <span id="status" class="badge">IDLE</span>
+                </div>
+                <progress
+                    id="progress"
+                    value="0"
+                    max="1"
+                    aria-label="Progress"
+                ></progress>
+                <span id="progressText" class="hint">0%</span>
+            </div>
+        </form>
+
+        <h2>Logs</h2>
+        <div id="logs" aria-live="polite"></div>
+
+        <hr class="divider" />
+
+        <footer>
+            Local, streaming processing. No data leaves your browser. — Built
+            for the Eight Sleep Pod rootfs jailbreak workflow.
+        </footer>
+
+        <script type="module">
+            /* ========= Utility helpers ========= */
+            const textDecoder = new TextDecoder();
+            const textEncoder = new TextEncoder();
+            const TAR_BLOCK = 512;
+            const ZERO_BLOCK = new Uint8Array(TAR_BLOCK);
+            const progressEl = document.getElementById("progress");
+            const progressTextEl = document.getElementById("progressText");
+            const statusEl = document.getElementById("status");
+            function clearLogs() {
+                document.getElementById("logs").innerHTML = "";
+            }
+            function log(msg, cls = "") {
+                const el = document.getElementById("logs");
+                const atBottom =
+                    el.scrollHeight - el.scrollTop - el.clientHeight < 10;
+                const line =
+                    "[" +
+                    new Date()
+                        .toISOString()
+                        .replace("T", " ")
+                        .replace("Z", "") +
+                    "] " +
+                    msg;
+                const div = document.createElement("div");
+                if (cls) div.className = cls;
+                div.textContent = line;
+                el.appendChild(div);
+                if (atBottom) el.scrollTop = el.scrollHeight;
+            }
+            function setStatus(s) {
+                statusEl.textContent = s;
+            }
+            function pct(num, den) {
+                return den ? ((num / den) * 100).toFixed(1) : "0.0";
+            }
+            function isAllZero(block) {
+                for (let i = 0; i < block.length; i++)
+                    if (block[i] !== 0) return false;
+                return true;
+            }
+            function parseOctal(buf, start, length) {
+                let str = "";
+                for (let i = start; i < start + length; i++) {
+                    const c = buf[i];
+                    if (c === 0 || c === 0x20) continue;
+                    str += String.fromCharCode(c);
+                }
+                str = str.trim();
+                return str ? parseInt(str, 8) || 0 : 0;
+            }
+            function readString(buf, start, length) {
+                let end = start;
+                const max = start + length;
+                while (end < max && buf[end] !== 0) end++;
+                return textDecoder.decode(buf.subarray(start, end));
+            }
+            function parseTarHeader(buf) {
+                if (buf.length < TAR_BLOCK) {
+                    return;
+                }
+
+                const name = readString(buf, 0, 100);
+                const mode = parseOctal(buf, 100, 8);
+                const uid = parseOctal(buf, 108, 8);
+                const gid = parseOctal(buf, 116, 8);
+                const size = parseOctal(buf, 124, 12);
+                const mtime = parseOctal(buf, 136, 12);
+                const type = readString(buf, 156, 1);
+                const linkname = readString(buf, 157, 100);
+                const format = readString(buf, 257, 6);
+                const uname = readString(buf, 265, 32);
+                const gname = readString(buf, 297, 32);
+
+                return {
+                    name,
+                    mode,
+                    uid,
+                    gid,
+                    size,
+                    mtime,
+                    type,
+                    linkname,
+                    format,
+                    uname,
+                    gname,
+                };
+            }
+            function padLength(size) {
+                return Math.ceil(size / TAR_BLOCK) * TAR_BLOCK;
+            }
+            function checksum(buf) {
+                let sum = 0;
+                for (let i = 0; i < buf.length; i++) sum += buf[i];
+                return sum.toString(8).padStart(6, "0");
+            }
+            function isValidChecksum(buf) {
+                if (
+                    buf.length < TAR_BLOCK ||
+                    buf[154] !== 0 ||
+                    buf[155] !== 0x20
+                )
+                    return false;
+                const clone = new Uint8Array(buf.subarray(0, TAR_BLOCK));
+                clone[148] = 0x20;
+                clone[149] = 0x20;
+                clone[150] = 0x20;
+                clone[151] = 0x20;
+                clone[152] = 0x20;
+                clone[153] = 0x20;
+                clone[154] = 0x20;
+                clone[155] = 0x20;
+                return textEncoder
+                    .encode(checksum(clone))
+                    .subarray(0, 6)
+                    .every((byte, index) => byte === buf[148 + index]);
+            }
+            function createTarHeader(
+                path,
+                size,
+                {
+                    mode = 0o644,
+                    uid = 0,
+                    gid = 0,
+                    mtime = Math.floor(Date.now() / 1000),
+                    type = "0",
+                    linkname = "",
+                    uname = "root",
+                    gname = "root",
+                } = {},
+            ) {
+                const buf = new Uint8Array(TAR_BLOCK);
+                function wStr(str, off, len) {
+                    const b = textEncoder.encode(str);
+                    buf.set(b.subarray(0, Math.min(len, b.length)), off);
+                }
+                function wOct(v, off, len) {
+                    const s = v.toString(8).padStart(len - 1, "0");
+                    wStr(s, off, len);
+                }
+                wStr(path, 0, 100);
+                wOct(mode, 100, 8);
+                wOct(uid, 108, 8);
+                wOct(gid, 116, 8);
+                wOct(size, 124, 12);
+                wOct(mtime, 136, 12);
+                for (let i = 148; i < 156; i++) buf[i] = 0x20;
+                wStr(type, 156, 1);
+                wStr(linkname, 157, 100);
+                wStr("ustar", 257, 6);
+                wStr("00", 263, 2);
+                wStr(uname, 265, 32);
+                wStr(gname, 297, 32);
+                wStr(checksum(buf), 148, 6);
+                buf[154] = 0;
+                buf[155] = 0x20;
+                return buf;
+            }
+            function concat(a, b) {
+                const c = new Uint8Array(a.length + b.length);
+                c.set(a, 0);
+                c.set(b, a.length);
+                return c;
+            }
+
+            /* ========= Bcrypt loader ========= */
+            let bcryptModulePromise = null;
+            function loadBcrypt() {
+                if (!bcryptModulePromise) {
+                    log("Loading bcryptjs module...");
+                    bcryptModulePromise = import(
+                        "https://cdn.jsdelivr.net/npm/bcryptjs@3.0.2/index.js"
+                    )
+                        .then((m) => {
+                            log("bcryptjs ready.");
+                            return m;
+                        })
+                        .catch((e) => {
+                            log("Failed to load bcryptjs: " + e, "err");
+                            throw e;
+                        });
+                }
+                return bcryptModulePromise;
+            }
+
+            /* ========= Templates ========= */
+            function makeService(addWebUI, disableCloud) {
+                const txt = `[Unit]
+            Description=Ninesleep
+            Requires=capybara.service
+
+            [Install]
+            WantedBy=multi-user.target
+
+            [Service]
+            Type=simple
+            Restart=always
+            ExecStart=/home/dac/ninesleep${disableCloud ? "" : " -mitm"}${addWebUI ? " -webui" : ""}
+            `;
+                return textEncoder.encode(
+                    txt.split("\n").map((line) => line.trim()),
+                );
+            }
+
+            function makeWifi(ssid, psk) {
+                const tpl = `[connection]
+            id=customer-wifi
+            uuid=632eb932-dd3c-4009-9556-7fa90292b977
+            type=wifi
+            interface-name=wlan0
+            permissions=
+
+            [wifi]
+            mac-address-blacklist=
+            mode=infrastructure
+            ssid=${ssid}
+
+            [wifi-security]
+            auth-alg=open
+            key-mgmt=wpa-psk
+            psk=${psk}
+
+            [ipv4]
+            dns-search=
+            method=auto
+
+            [ipv6]
+            addr-gen-mode=stable-privacy
+            dns-search=
+            method=auto
+
+            [proxy]
+            `;
+                return textEncoder.encode(
+                    tpl.split("\n").map((line) => line.trim()),
+                );
+            }
+
+            /* ========= Tar streaming parser (TransformStream subclass) ========= */
+            class TarBlockParser extends TransformStream {
+                constructor() {
+                    const state = {
+                        buffer: new Uint8Array(0),
+                        remainingFileSize: 0,
+                        eof: false,
+                    };
+                    super({
+                        async transform(chunk, controller) {
+                            if (state.eof) {
+                                return;
+                            }
+
+                            if (
+                                state.buffer.length + chunk.length <
+                                TAR_BLOCK
+                            ) {
+                                if (state.buffer.length) {
+                                    state.buffer = concat(state.buffer, chunk);
+                                } else {
+                                    state.buffer = chunk;
+                                }
+
+                                return;
+                            }
+
+                            if (state.buffer.length) {
+                                chunk = concat(state.buffer, chunk);
+                            }
+
+                            while (chunk.length > TAR_BLOCK) {
+                                if (state.remainingFileSize <= 0) {
+                                    // header block
+
+                                    const block = chunk.subarray(0, TAR_BLOCK);
+                                    chunk = chunk.subarray(TAR_BLOCK);
+
+                                    if (isAllZero(block)) {
+                                        if (chunk.length < TAR_BLOCK) {
+                                            // not enough bytes to check the second null block
+                                            chunk = concat(block, chunk);
+                                        } else if (
+                                            isAllZero(
+                                                chunk.subarray(0, TAR_BLOCK),
+                                            )
+                                        ) {
+                                            // confirmed end-of-archive marker
+                                            state.buffer = new Uint8Array();
+                                            state.eof = true;
+                                        } else {
+                                            controller.error(
+                                                "malformed tar header block",
+                                            );
+                                        }
+
+                                        break;
+                                    }
+
+                                    if (!isValidChecksum(block)) {
+                                        controller.error(
+                                            "invalid tar header checksum",
+                                        );
+
+                                        break;
+                                    }
+
+                                    const header = parseTarHeader(block);
+
+                                    controller.enqueue({
+                                        ...header,
+                                        kind: "header",
+                                        block,
+                                    });
+
+                                    state.remainingFileSize = header.size;
+                                } else {
+                                    // data block
+
+                                    const block = chunk.subarray(
+                                        0,
+                                        Math.min(
+                                            Math.ceil(
+                                                state.remainingFileSize /
+                                                    TAR_BLOCK,
+                                            ),
+                                            Math.floor(
+                                                chunk.length / TAR_BLOCK,
+                                            ),
+                                        ) * TAR_BLOCK,
+                                    );
+
+                                    chunk = chunk.subarray(block.length);
+
+                                    controller.enqueue({
+                                        kind: "data",
+                                        data: block.subarray(
+                                            0,
+                                            Math.min(
+                                                block.length,
+                                                state.remainingFileSize,
+                                            ),
+                                        ),
+                                        block,
+                                    });
+
+                                    state.remainingFileSize -= block.length;
+                                }
+                            }
+
+                            state.buffer = chunk;
+                        },
+
+                        flush(controller) {
+                            if (!state.eof) {
+                                controller.error("unexpected eof");
+                            }
+                        },
+                    });
+                }
+            }
+
+            class TarBlockProcessor extends TransformStream {
+                constructor({ onEntry, onEnd }) {
+                    const state = {};
+                    super({
+                        async transform({ kind, block, ...rest }, controller) {
+                            switch (kind) {
+                                case "header":
+                                    if (
+                                        state.action &&
+                                        state.action.type === "read"
+                                    ) {
+                                        await this.enqueueEmissions(
+                                            controller,
+                                            state.action.onData(null),
+                                        );
+                                    }
+
+                                    state.action = { type: "write" };
+                                    if (onEntry) {
+                                        state.action =
+                                            (await onEntry(rest)) ||
+                                            state.action;
+                                    }
+
+                                    switch (state.action.type) {
+                                        case "write":
+                                            controller.enqueue(block);
+                                            break;
+
+                                        case "omit":
+                                            break;
+                                    }
+
+                                    break;
+
+                                case "data":
+                                    switch (state.action.type) {
+                                        case "write":
+                                            controller.enqueue(block);
+                                            break;
+
+                                        case "read":
+                                            await this.enqueueEmissions(
+                                                controller,
+                                                await state.action.onData(
+                                                    rest.data,
+                                                ),
+                                            );
+
+                                        case "omit":
+                                            break;
+                                    }
+                                    break;
+                            }
+                        },
+
+                        async flush(controller) {
+                            if (state.action && state.action.type === "read") {
+                                await this.enqueueEmissions(
+                                    controller,
+                                    await state.action.onData(null),
+                                );
+                            }
+
+                            await this.enqueueEmissions(
+                                controller,
+                                await onEnd(controller),
+                            );
+                            controller.enqueue(ZERO_BLOCK);
+                            controller.enqueue(ZERO_BLOCK);
+                        },
+
+                        async enqueueEmissions(controller, emissions) {
+                            if (!emissions) {
+                                return;
+                            }
+
+                            if (
+                                !(Symbol.asyncIterator in emissions) &&
+                                !(Symbol.iterator in emissions)
+                            ) {
+                                emissions = [emissions];
+                            }
+
+                            for await (const {
+                                name,
+                                contents,
+                                ...options
+                            } of emissions) {
+                                const header = createTarHeader(
+                                    name,
+                                    contents?.length ?? 0,
+                                    options,
+                                );
+                                console.log(
+                                    name,
+                                    contents?.length,
+                                    options,
+                                    header,
+                                    parseTarHeader(header),
+                                    isValidChecksum(header),
+                                );
+                                controller.enqueue(header);
+
+                                let byteCount = 0;
+                                if (contents instanceof Uint8Array) {
+                                    controller.enqueue(contents);
+                                    byteCount += contents.length;
+                                } else if (
+                                    contents?.readable instanceof ReadableStream
+                                ) {
+                                    for await (const chunk of contents.readable) {
+                                        controller.enqueue(chunk);
+                                        byteCount += chunk.length;
+                                    }
+                                }
+
+                                const mod = byteCount % TAR_BLOCK;
+                                if (mod) {
+                                    controller.enqueue(
+                                        ZERO_BLOCK.subarray(0, TAR_BLOCK - mod),
+                                    );
+                                }
+                            }
+                        },
+                    });
+                }
+            }
+
+            class ProgressTransformStream extends TransformStream {
+                #byteCount = 0;
+                constructor(onProgress) {
+                    super({
+                        transform: (chunk, controller) => {
+                            this.#byteCount += chunk.length;
+                            onProgress(this.#byteCount);
+                            controller.enqueue(chunk);
+                        },
+                    });
+                }
+                get byteCount() {
+                    return this.#byteCount;
+                }
+            }
+
+            const ELF_HEADER_SIZE = 16;
+            function isElf(buf) {
+                // elf magic number
+                return (
+                    buf.length >= ELF_HEADER_SIZE &&
+                    [0x7f, 0x45, 0x4c, 0x46].every(
+                        (byte, index) => byte === buf[index],
+                    )
+                );
+            }
+
+            function isValidElf(buf) {
+                // pod3 is linux aarch64
+                if (!isElf(buf)) return false;
+
+                // ELFCLASS64
+                if (buf[4] != 0x02) return false;
+                // data encoding doesn't matter
+                // elf version doesn't matter
+                // ELFOSABI_NONE or ELFOSABI_LINUX
+                if (buf[7] !== 0x00 && buf[7] !== 0x03) return false;
+                // abi version _probably_ doesn't matter
+                return true;
+            }
+
+            function isGzipped(buf) {
+                return [0x1f, 0x8b, 0x08].every(
+                    (byte, index) => byte === buf[index],
+                );
+            }
+
+            function isTar(buf) {
+                if (buf.length <= 262) return false;
+                if (
+                    buf[257] !== 0x75 ||
+                    buf[258] !== 0x73 ||
+                    buf[259] !== 0x74 ||
+                    buf[260] !== 0x61 ||
+                    buf[261] !== 0x72 ||
+                    buf[262] !== 0x00
+                )
+                    return false;
+                return isValidChecksum(buf);
+            }
+
+            async function peekBytes(readable, n) {
+                const [temp, original] = readable.tee();
+                try {
+                    const reader = temp.getReader();
+                    try {
+                        let result = new Uint8Array();
+                        while (result.length < n) {
+                            const chunk = await reader.read();
+                            if (chunk.done) {
+                                return;
+                            }
+
+                            result = concat(result, chunk.value);
+                        }
+
+                        return [result, original];
+                    } finally {
+                        reader.releaseLock();
+                    }
+                } finally {
+                    temp.cancel();
+                }
+            }
+
+            /* ========= Stream ninesleep binary from release tar.gz (no full buffering) ========= */
+            async function streamNinesleepBinary(version) {
+                let readable;
+                let size;
+                if (version instanceof Blob) {
+                    readable = version.stream();
+                    size = version;
+                } else {
+                    const url = `https://raw.githubusercontent.com/ssttevee/ninesleep-go/refs/tags/${encodeURIComponent(
+                        version,
+                    )}-bin/ninesleep.tar.gz`;
+                    log("Downloading ninesleep release: " + url);
+                    const resp = await fetch(url);
+                    if (!resp.ok) {
+                        throw new Error(
+                            "Failed fetching release: " + resp.status,
+                        );
+                    }
+
+                    readable = resp.body;
+                }
+
+                // determine if it is gzipped
+                let leadingChunk;
+                console.log("peeking bytes 1");
+                [leadingChunk, readable] = await peekBytes(readable, TAR_BLOCK);
+                console.log("peeking bytes 1.1");
+                if (isGzipped(leadingChunk)) {
+                    console.log("ungzipping");
+                    readable = readable.pipeThrough(
+                        new DecompressionStream("gzip"),
+                    );
+                    console.log("peeking bytes 2");
+                    [leadingChunk, readable] = await peekBytes(
+                        readable,
+                        TAR_BLOCK,
+                    );
+                    console.log("peeking bytes 2.1");
+
+                    // can't determine size from gzipped file
+                    size = undefined;
+                }
+
+                // determine if it is a bare elf or a tape archive
+                if (isTar(leadingChunk)) {
+                    console.log("untarring");
+                    let step = 0;
+                    readable = readable
+                        .pipeThrough(new TarBlockParser())
+                        .pipeThrough(
+                            new TransformStream({
+                                transform(chunk, controller) {
+                                    switch (chunk.kind) {
+                                        case "header":
+                                            if (step !== 0) {
+                                                controller.terminate();
+                                                return;
+                                            }
+
+                                            if (
+                                                chunk.name === "ninesleep" &&
+                                                chunk.type === "0"
+                                            ) {
+                                                step = 1;
+                                            }
+
+                                            break;
+
+                                        case "data":
+                                            if (step === 1) {
+                                                if (!isValidElf(chunk.data)) {
+                                                    controller.error(
+                                                        `invalid executable`,
+                                                    );
+                                                    return;
+                                                }
+                                                step = 2;
+                                            }
+
+                                            controller.enqueue(chunk.data);
+                                            break;
+                                    }
+                                },
+                            }),
+                        );
+
+                    ({ size } = parseTarHeader(leadingChunk));
+
+                    console.log("peeking bytes 3");
+                    [leadingChunk, readable] = await peekBytes(
+                        readable,
+                        ELF_HEADER_SIZE,
+                    );
+                    console.log("peeking bytes 3.1");
+                }
+
+                if (!size) {
+                    throw new Error("Unsupported binary");
+                }
+
+                if (!isValidElf(leadingChunk)) {
+                    console.log(leadingChunk.subarray(0, ELF_HEADER_SIZE));
+                    throw new Error("Invalid ELF file");
+                }
+
+                return {
+                    length: size,
+                    readable,
+                };
+            }
+
+            /* ========= Main patch orchestration ========= */
+            async function patchRootFS({
+                file,
+                outFileName,
+                rootPassword,
+                bcryptCost,
+                wifiEnable,
+                wifiSsid,
+                wifiPsk,
+                ninesleepVersion,
+                customBinary,
+                addWebUI,
+                disableCloud,
+                sshKeys,
+            }) {
+                clearLogs();
+
+                setStatus("PREP");
+                log("Opening save file picker...");
+                let saveHandle;
+                try {
+                    saveHandle = await window.showSaveFilePicker({
+                        suggestedName: outFileName || "rootfs.patched.tar.gz",
+                        types: [
+                            {
+                                description: "GZip Archive",
+                                accept: { "application/gzip": [".gz"] },
+                            },
+                        ],
+                    });
+                } catch {
+                    setStatus("ABORTED");
+                    log("Aborting: No output path picked.", "err");
+                    return;
+                }
+                const writable = await saveHandle.createWritable();
+                log("Save destination selected.");
+
+                let totalInputBytes = file.size;
+                let totalBinaryBytes = 0;
+                let processedBytes = 0;
+                let downloadedBytes = 0;
+                let finalized = 0;
+                function updateProgress() {
+                    // scale the two parts so they both take 50%
+                    const max = Math.max(totalInputBytes, totalBinaryBytes);
+                    const val =
+                        (processedBytes / totalInputBytes) * max +
+                        (downloadedBytes / totalBinaryBytes) * max +
+                        finalized;
+                    progressEl.max = max * 2 + 1;
+                    progressEl.value = val;
+                    progressTextEl.textContent = pct(val, progressEl.max) + "%";
+                }
+
+                let shadowReplaced = false;
+
+                const gzipDecompress = new DecompressionStream("gzip");
+                const gzipCompress = new CompressionStream("gzip");
+
+                let binaryStream;
+                try {
+                    binaryStream = await streamNinesleepBinary(
+                        customBinary ?? ninesleepVersion,
+                    );
+                    totalBinaryBytes = binaryStream.length;
+                    binaryStream.readable = binaryStream.readable.pipeThrough(
+                        new ProgressTransformStream((bytes) => {
+                            downloadedBytes = bytes;
+                            updateProgress();
+                        }),
+                    );
+                } catch (e) {
+                    log("Failed to get ninesleep binary", "err");
+                    throw e;
+                }
+
+                setStatus("PATCHING");
+                log("Patching...");
+                updateProgress();
+
+                await file
+                    .stream()
+                    .pipeThrough(
+                        new ProgressTransformStream((bytes) => {
+                            processedBytes = bytes;
+                            updateProgress();
+                        }),
+                    )
+                    .pipeThrough(gzipDecompress)
+                    .pipeThrough(new TarBlockParser())
+                    .pipeThrough(
+                        new TarBlockProcessor({
+                            async onEntry({ name, size, ...rest }) {
+                                if (name === "./etc/ssh/authorized_keys") {
+                                    log("Deleting original ssh keys");
+                                    return { type: "omit" };
+                                }
+
+                                if (name === "./etc/shadow" && rootPassword) {
+                                    let buf = new Uint8Array();
+                                    return {
+                                        type: "read",
+                                        async onData(data) {
+                                            if (data) {
+                                                buf = concat(buf, data);
+                                                return;
+                                            }
+
+                                            const lines = textDecoder
+                                                .decode(content)
+                                                .split("\n");
+                                            for (
+                                                let i = 0;
+                                                i < lines.length;
+                                                i++
+                                            ) {
+                                                if (
+                                                    lines[i].startsWith("root:")
+                                                ) {
+                                                    const parts =
+                                                        lines[i].split(":");
+                                                    parts[1] = await (
+                                                        await loadBcrypt()
+                                                    ).hash(
+                                                        rootPassword,
+                                                        bcryptCost,
+                                                    );
+                                                    lines[i] = parts.join(":");
+                                                    shadowReplaced = true;
+                                                    log(
+                                                        "Updating root password",
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                            const replaced = textEncoder.encode(
+                                                lines.join("\n"),
+                                            );
+
+                                            return {
+                                                ...rest,
+                                                name,
+                                                contents: replaced,
+                                            };
+                                        },
+                                    };
+                                }
+                            },
+                            async *onEnd() {
+                                setStatus("APPEND");
+
+                                // ninesleep binary
+                                yield {
+                                    name: "./home/dac/ninesleep",
+                                    mode: 0o755,
+                                    contents: binaryStream,
+                                };
+
+                                log("Added ninesleep binary");
+
+                                // service file
+                                yield {
+                                    name: "./etc/systemd/system/ninesleep.service",
+                                    mode: 0o644,
+                                    contents: makeService(
+                                        addWebUI,
+                                        disableCloud,
+                                    ),
+                                };
+
+                                log("Added ninesleep service");
+
+                                // enable service
+                                yield {
+                                    name: "./etc/systemd/system/multi-user.target.wants/ninesleep.service",
+                                    type: "2",
+                                    linkname: "../ninesleep.service",
+                                    mode: 0o600,
+                                };
+
+                                log("Enabled ninesleep service");
+
+                                // mask swupdate
+                                yield {
+                                    name: "./etc/systemd/system/swupdate.service",
+                                    type: "2",
+                                    linkname: "/dev/null",
+                                    mode: 0o600,
+                                };
+
+                                log("Masked swupdate service");
+
+                                // wifi
+                                if (wifiEnable) {
+                                    if (wifiSsid && wifiPsk) {
+                                        yield {
+                                            name: "./etc/NetworkManager/system-connections/customer-wifi.nmconnection",
+                                            mode: 0o600,
+                                            contents: makeWifi(
+                                                wifiSsid,
+                                                wifiPsk,
+                                            ),
+                                        };
+
+                                        log("Added wifi configuration");
+                                    } else {
+                                        log(
+                                            "Wi-Fi enabled but missing SSID or password; skipped.",
+                                            "warn",
+                                        );
+                                    }
+                                }
+
+                                // authorized_keys
+                                {
+                                    const cleaned = (sshKeys || "").replace(
+                                        /\r\n/g,
+                                        "\n",
+                                    );
+                                    const contents = textEncoder.encode(
+                                        cleaned
+                                            ? cleaned.endsWith("\n")
+                                                ? cleaned
+                                                : cleaned + "\n"
+                                            : "",
+                                    );
+                                    yield {
+                                        name: "./etc/ssh/authorized_keys",
+                                        contents,
+                                        mode: 0o644,
+                                    };
+
+                                    if (contents.length) {
+                                        log("Added ssh public keys");
+                                    }
+                                }
+
+                                finalized = 1;
+                                updateProgress();
+                            },
+                        }),
+                    )
+                    .pipeThrough(gzipCompress)
+                    .pipeTo(writable);
+
+                setStatus("DONE");
+                updateProgress();
+                if (rootPassword && !shadowReplaced) {
+                    log(
+                        "Note: /etc/shadow not found; password not applied.",
+                        "warn",
+                    );
+                }
+                log("Completed. Patched archive written.", "ok");
+            }
+
+            /* ========= UI Binding ========= */
+            document
+                .getElementById("toggleAdvanced")
+                .addEventListener("click", () => {
+                    const adv = document.getElementById("advanced");
+                    const visible = adv.classList.toggle("visible");
+                    document.getElementById("toggleAdvanced").textContent =
+                        visible
+                            ? "Hide Advanced Settings"
+                            : "Show Advanced Settings";
+                });
+            document
+                .getElementById("ninesleepVersion")
+                .addEventListener("change", (e) => {
+                    if (e.target.value === "custom") {
+                        document.getElementById("customBinary").required = true;
+                        document.getElementById("customBinary").click();
+                    } else {
+                        document.getElementById("customBinary").required =
+                            false;
+                        document.getElementById("customBinary").value = "";
+                    }
+                });
+            document
+                .getElementById("customBinary")
+                .addEventListener("change", (e) => {
+                    document.getElementById("ninesleepVersion").value =
+                        "custom";
+                });
+            document
+                .getElementById("wifiEnable")
+                .addEventListener("change", (e) => {
+                    document.getElementById("wifiFields").style.display = e
+                        .target.checked
+                        ? "block"
+                        : "none";
+                });
+            document
+                .getElementById("patchForm")
+                .addEventListener("submit", async (e) => {
+                    e.preventDefault();
+                    const fileInput = document.getElementById("rootfsFile");
+                    if (!fileInput.files.length) {
+                        alert("Select a rootfs.tar.gz file first.");
+                        return;
+                    }
+                    const file = fileInput.files[0];
+                    const startBtn = document.getElementById("startBtn");
+                    startBtn.disabled = true;
+                    try {
+                        await patchRootFS({
+                            file,
+                            outFileName: "rootfs.patched.tar.gz",
+                            sshKeys: document.getElementById("sshKeys").value,
+                            rootPassword:
+                                document.getElementById("rootPassword").value ||
+                                "",
+                            bcryptCost: parseInt(
+                                document.getElementById("bcryptCost").value,
+                                10,
+                            ),
+                            wifiEnable:
+                                document.getElementById("wifiEnable").checked,
+                            wifiSsid: document
+                                .getElementById("wifiSsid")
+                                .value.trim(),
+                            wifiPsk: document
+                                .getElementById("wifiPsk")
+                                .value.trim(),
+                            ninesleepVersion: document
+                                .getElementById("ninesleepVersion")
+                                .value.trim(),
+                            customBinary:
+                                document.getElementById("customBinary")
+                                    .files[0],
+                            addWebUI:
+                                document.getElementById("addWebUI").checked,
+                            disableCloud:
+                                document.getElementById("disableCloud").checked,
+                        });
+                    } catch (err) {
+                        setStatus("ERROR");
+                        log("ERROR: " + ((err && err.stack) || err), "err");
+                        alert("Error encountered. See logs for details.");
+                    } finally {
+                        startBtn.disabled = false;
+                    }
+                });
+        </script>
+    </body>
+</html>
