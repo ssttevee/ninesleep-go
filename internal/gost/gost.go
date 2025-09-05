@@ -79,14 +79,10 @@ type Manager struct {
 	stopRightHeating func() error
 
 	// configuration
-	name        string
-	apiPort     uint16
-	pollEvery   time.Duration
-	enableMDNS  bool
-	varsCommand int // which command ID triggers variable refresh (mirrors controller default 14)
-
-	// last success tracking
-	lastPollSuccess time.Time
+	name       string
+	apiPort    uint16
+	pollEvery  time.Duration
+	enableMDNS bool
 
 	// entity maps
 	floatSensors      map[string]*floatSensor
@@ -134,15 +130,6 @@ func WithMDNS(v bool) Option {
 	return func(m *Manager) { m.enableMDNS = v }
 }
 
-// WithVariablesCommand overrides the command ID used to request variables.
-func WithVariablesCommand(id int) Option {
-	return func(m *Manager) {
-		if id > 0 {
-			m.varsCommand = id
-		}
-	}
-}
-
 // WithDisabledSensors marks specified sensor IDs to be disabled by default
 // when first registered (Home Assistant will show them as entities that must
 // be manually enabled).
@@ -168,7 +155,6 @@ func NewManager(pod *controller.PodController, opts ...Option) *Manager {
 		apiPort:           6053,
 		pollEvery:         15 * time.Second,
 		enableMDNS:        true,
-		varsCommand:       14,
 		floatSensors:      map[string]*floatSensor{},
 		binarySensors:     map[string]*binSensor{},
 		textSensors:       map[string]*textSensor{},
@@ -347,6 +333,12 @@ func (m *Manager) initNode(ctx context.Context) {
 	m.pod.SetOnMitmConnected(func(connected bool) {
 		m.setBinary(EntityIDCloudConnected, connected)
 	})
+	m.pod.SetOnFrankenConnected(func(connected bool) {
+		m.setBinary(EntityIDPodAvailable, connected)
+	})
+	m.pod.SetOnVariables(func(pv *controller.PodVariables) {
+		m.updateFromParsed(ctx, pv)
+	})
 	m.setSwitch(EntityIDEnableCloud, m.pod.GetMitmMode())
 	m.setSwitch(EntityIDSyncSides, false)
 	m.setNumber(EntityIDTemperatureOffset, 25)
@@ -388,34 +380,44 @@ func (m *Manager) pollLoop(ctx context.Context) {
 			}
 		}
 
-		m.pollOnce()
+		m.pollOnce(ctx)
 
 		t.Reset(m.pollEvery)
 	}
 }
 
-func (m *Manager) pollOnce() {
+func (m *Manager) pollOnce(ctx context.Context) {
 	if m.pod == nil {
 		return
 	}
-	_, err := m.pod.ExecuteRaw(m.varsCommand, "")
-	now := time.Now()
-	if err != nil {
-		// heartbeat sensor still updated
-		m.setFloat(EntityIDPodHeartbeatEpoch, float32(now.Unix()))
-		m.updateAvailability()
-		return
-	}
-	m.lastPollSuccess = now
-	m.updateFromParsed()
-	m.updateAvailability()
+
+	m.setFloat(EntityIDPodHeartbeatEpoch, float32(time.Now().Unix()))
+	m.setBinary(EntityIDPodAvailable, m.pod.ExecuteVariables(ctx) == nil)
 }
 
-func (m *Manager) updateFromParsed() {
-	pv := m.pod.ParsedVariables()
-	if pv == nil {
-		return
+func (m *Manager) updateFromParsed(ctx context.Context, pv *controller.PodVariables) {
+	if m.syncSides {
+		if pv.TargetHeatLevelL != pv.TargetHeatLevelR {
+			go func() {
+				if err := m.pod.ExecuteHeatLevel(ctx, controller.SideRight, pv.TargetHeatLevelL); err != nil {
+					slog.Warn("failed to sync heat level", "err", err)
+				}
+			}()
+
+			pv.TargetHeatLevelL = pv.TargetHeatLevelL
+		}
+
+		if (pv.HeatTimeL > 0) != (pv.HeatTimeR > 0) {
+			go func() {
+				if err := m.doHeatSwitch(ctx, controller.SideRight, pv.HeatTimeL > 0); err != nil {
+					slog.Error("failed to sync heat switch", "err", err)
+				}
+			}()
+
+			pv.HeatTimeR = pv.HeatTimeL
+		}
 	}
+
 	// Numeric
 	m.setNumber(EntityIDLedBrightness, float32(pv.LedBrightness))
 	m.setNumber(EntityIDTargetHeatLevelLeft, float32(pv.TargetHeatLevelL))
@@ -434,9 +436,6 @@ func (m *Manager) updateFromParsed() {
 	// Text
 	m.setText(EntityIDSensorLabel, pv.SensorLabel)
 	m.setText(EntityIDSettingsRaw, pv.SettingsRaw)
-
-	// Heartbeat (fast path)
-	m.setFloat(EntityIDPodHeartbeatEpoch, float32(time.Now().Unix()))
 
 	// Climates
 	offset := m.numberEntities[EntityIDTemperatureOffset].State().State
@@ -469,29 +468,6 @@ func (m *Manager) updateFromParsed() {
 		)
 		cs.CurrentTemperature = offset + float32(pv.HeatLevelR)/10
 	})
-
-	if m.syncSides {
-		if pv.TargetHeatLevelL != pv.TargetHeatLevelR {
-			if err := m.pod.ExecuteHeatLevel(controller.SideRight, pv.TargetHeatLevelL); err != nil {
-				slog.Warn("failed to sync heat level", "err", err)
-			}
-		}
-
-		if (pv.HeatTimeL > 0) != (pv.HeatTimeR > 0) {
-			if err := m.doHeatSwitch(context.Background(), controller.SideRight, pv.HeatTimeL > 0); err != nil {
-				slog.Error("failed to sync heat switch", "err", err)
-			}
-		}
-	}
-}
-
-func (m *Manager) updateAvailability() {
-	grace := 5 * time.Second
-	ok := false
-	if !m.lastPollSuccess.IsZero() {
-		ok = time.Since(m.lastPollSuccess) <= 2*m.pollEvery+grace
-	}
-	m.setBinary(EntityIDPodAvailable, ok)
 }
 
 const heatLoopSeconds = 21600
@@ -506,7 +482,7 @@ func (m *Manager) startHeatLoop(ctx context.Context, side controller.Side) (func
 			case <-time.After(time.Hour):
 			}
 
-			if err := m.pod.ExecuteHeatDuration(side, heatLoopSeconds); err != nil {
+			if err := m.pod.ExecuteHeatDuration(ctx, side, heatLoopSeconds); err != nil {
 				slog.Error("failed to execute heat duration: %v", "err", err)
 			}
 
@@ -518,8 +494,8 @@ func (m *Manager) startHeatLoop(ctx context.Context, side controller.Side) (func
 	return func() error {
 		cancel()
 
-		return m.pod.ExecuteHeatDuration(side, 0)
-	}, m.pod.ExecuteHeatDuration(side, heatLoopSeconds)
+		return m.pod.ExecuteHeatDuration(ctx, side, 0)
+	}, m.pod.ExecuteHeatDuration(ctx, side, heatLoopSeconds)
 }
 
 // -------- Entity implementations --------
@@ -754,11 +730,11 @@ func (c *climateEntity) EntityCategory() entity.Category       { return c.ent.En
 // Button entity (press callback)
 type buttonEntity struct {
 	ent     *entity.BaseEntity
-	onPress func() error
+	onPress func(ctx context.Context) error
 }
 
 // OnPress registers a callback for button press service calls.
-func (b *buttonEntity) OnPress(cb func() error) { b.onPress = cb }
+func (b *buttonEntity) OnPress(cb func(context.Context) error) { b.onPress = cb }
 
 func (b *buttonEntity) Setup()       {}
 func (b *buttonEntity) Close() error { return nil }
@@ -769,7 +745,7 @@ func (b *buttonEntity) Icon() string                          { return "" }
 func (b *buttonEntity) DeviceClass() entity.ButtonDeviceClass { return "" }
 func (b *buttonEntity) Press(ctx context.Context) error {
 	if b.onPress != nil {
-		return b.onPress()
+		return b.onPress(ctx)
 	}
 	return nil
 }
@@ -1029,6 +1005,13 @@ func (m *Manager) doHeatSwitch(ctx context.Context, side controller.Side, state 
 		}
 
 		*stopFuncPtr = nil
+	} else {
+		// maybe turned on before start
+		if err := m.pod.ExecuteHeatDuration(ctx, side, 0); err != nil {
+			slog.Error("failed to execute heat duration: %v", "err", err)
+		}
+
+		m.setFloat(fmt.Sprintf("heat_time_%s_seconds", side), 0)
 	}
 
 	return nil
@@ -1078,7 +1061,7 @@ func (m *Manager) heatSwitchHandler(side controller.Side) func(ctx context.Conte
 }
 
 func (m *Manager) heatLevelEffect(ctx context.Context, side controller.Side, newState float32) error {
-	if err := m.pod.ExecuteHeatLevel(side, int(newState)); err != nil {
+	if err := m.pod.ExecuteHeatLevel(ctx, side, int(newState)); err != nil {
 		return err
 	}
 
@@ -1134,7 +1117,7 @@ func climateAction(on bool, currentLevel, targetLevel float32) entity.ClimateAct
 }
 
 func (m *Manager) climateEffectTemp(ctx context.Context, side controller.Side, newLevel float32) error {
-	if err := m.pod.ExecuteHeatLevel(side, int(newLevel)); err != nil {
+	if err := m.pod.ExecuteHeatLevel(ctx, side, int(newLevel)); err != nil {
 		return err
 	}
 
@@ -1289,7 +1272,7 @@ func (m *Manager) preRegisterEntities() {
 		maxValue: 100,
 		step:     1,
 		onSet: func(ctx context.Context, newValue float32, current entity.NumberState) error {
-			_, err := m.pod.ExecuteSettings(controller.SettingsInput{LB: max(0, min(100, int(newValue)))})
+			_, err := m.pod.ExecuteSettings(ctx, controller.SettingsInput{LB: max(0, min(100, int(newValue)))})
 			return err
 		},
 	})
@@ -1307,20 +1290,20 @@ func (m *Manager) preRegisterEntities() {
 		},
 	})
 	// Buttons
-	m.registerButtonEntity(EntityIDPrimeButton, false, &buttonEntity{onPress: func() error {
-		_, err := m.pod.ExecuteFranken(controller.FrankenCommandPrime, "")
+	m.registerButtonEntity(EntityIDPrimeButton, false, &buttonEntity{onPress: func(ctx context.Context) error {
+		_, err := m.pod.ExecuteFranken(ctx, controller.FrankenCommandPrime, "")
 		return err
 	}})
-	m.registerButtonEntity(EntityIDFirmwareResetButton, true, &buttonEntity{onPress: func() error {
-		_, err := m.pod.ExecuteFranken(controller.FrankenCommandReset, "")
+	m.registerButtonEntity(EntityIDFirmwareResetButton, true, &buttonEntity{onPress: func(ctx context.Context) error {
+		_, err := m.pod.ExecuteFranken(ctx, controller.FrankenCommandReset, "")
 		return err
 	}})
-	m.registerButtonEntity(EntityIDPowerResetButton, true, &buttonEntity{onPress: func() error {
-		_, err := m.pod.ExecuteFranken(controller.FrankenCommandForceReset, "")
+	m.registerButtonEntity(EntityIDPowerResetButton, true, &buttonEntity{onPress: func(ctx context.Context) error {
+		_, err := m.pod.ExecuteFranken(ctx, controller.FrankenCommandForceReset, "")
 		return err
 	}})
-	m.registerButtonEntity(EntityIDFactoryResetButton, true, &buttonEntity{onPress: func() error {
-		_, err := m.pod.ExecuteFranken(controller.FrankenCommandFormat, "")
+	m.registerButtonEntity(EntityIDFactoryResetButton, true, &buttonEntity{onPress: func(ctx context.Context) error {
+		_, err := m.pod.ExecuteFranken(ctx, controller.FrankenCommandFormat, "")
 		return err
 	}})
 	// Climate

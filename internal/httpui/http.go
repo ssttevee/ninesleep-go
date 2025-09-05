@@ -89,9 +89,9 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	)
 	switch action {
 	case "hello":
-		resp, err = s.pod.ExecuteFranken(controller.FrankenCommandHello, "")
+		resp, err = s.pod.ExecuteFranken(r.Context(), controller.FrankenCommandHello, "")
 	case "variables":
-		resp, err = s.pod.ExecuteFranken(controller.FrankenCommandPleaseSendVariables, "")
+		resp, err = s.pod.ExecuteFranken(r.Context(), controller.FrankenCommandPleaseSendVariables, "")
 	case "alarm":
 		side, err := controller.SideFromString(r.FormValue("side"))
 		if err != nil {
@@ -105,14 +105,14 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		if pattern == "" {
 			pattern = "double"
 		}
-		resp, err = s.pod.ExecuteAlarm(controller.AlarmInput{
+		resp, err = s.pod.ExecuteAlarm(r.Context(), controller.AlarmInput{
 			Side: side, PL: pl, DU: du, TT: tt, Pattern: pattern,
 		})
 	case "alarm-clear":
-		resp, err = s.pod.ExecuteRaw(16, "")
+		resp, err = s.pod.ExecuteRaw(r.Context(), 16, "")
 	case "settings":
 		lb, _ := strconv.Atoi(r.FormValue("lb"))
-		resp, err = s.pod.ExecuteSettings(controller.SettingsInput{LB: lb})
+		resp, err = s.pod.ExecuteSettings(r.Context(), controller.SettingsInput{LB: lb})
 	case "temperature":
 		side, err := controller.SideFromString(r.FormValue("side"))
 		if err != nil {
@@ -120,7 +120,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		val, _ := strconv.Atoi(r.FormValue("value"))
-		err = s.pod.ExecuteHeatLevel(side, val)
+		err = s.pod.ExecuteHeatLevel(r.Context(), side, val)
 	case "temperature-duration":
 		side, err := controller.SideFromString(r.FormValue("side"))
 		if err != nil {
@@ -128,13 +128,13 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		val, _ := strconv.Atoi(r.FormValue("value"))
-		err = s.pod.ExecuteHeatDuration(side, val)
+		err = s.pod.ExecuteHeatDuration(r.Context(), side, val)
 	case "prime":
-		err = s.pod.ExecutePrime()
+		err = s.pod.ExecutePrime(r.Context())
 	case "raw":
 		cmdID, _ := strconv.Atoi(r.FormValue("cmd"))
 		payload := strings.TrimSpace(r.FormValue("payload"))
-		resp, err = s.pod.ExecuteRaw(cmdID, payload)
+		resp, err = s.pod.ExecuteRaw(r.Context(), cmdID, payload)
 	default:
 		err = fmt.Errorf("unknown action %q", action)
 	}

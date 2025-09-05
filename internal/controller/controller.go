@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"maps"
 	"net"
 	"os"
@@ -22,10 +23,11 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
-const (
-	// DefaultSocketReadTimeout limits how long we wait for a single response read.
-	DefaultSocketReadTimeout = 50 * time.Millisecond
+var (
+	errNoFranken = errors.New("no active connection")
+)
 
+const (
 	// DacSocketPath is the unix domain socket path used by the firmware and first‑party service.
 	DacSocketPath = "/deviceinfo/dac.sock"
 )
@@ -163,25 +165,8 @@ type PodVariables struct {
 	Raw        string            `json:"raw"`
 }
 
-// VariablesCallback is invoked after parsing a variables response.
-type VariablesCallback func(pv *PodVariables)
-
 // Option mutates controller configuration.
 type Option func(*PodController)
-
-// WithReadTimeout overrides the socket read timeout.
-func WithReadTimeout(d time.Duration) Option {
-	return func(p *PodController) { p.readTimeout = d }
-}
-
-// WithVariablesCallback registers a callback invoked after each successful variables parse.
-func WithVariablesCallback(cb VariablesCallback) Option {
-	return func(p *PodController) {
-		if cb != nil {
-			p.varCallbacks = append(p.varCallbacks, cb)
-		}
-	}
-}
 
 // WithMITM enables or disables man-in-the-middle mode.
 func WithMITM(enabled bool) Option {
@@ -194,22 +179,22 @@ func WithMITM(enabled bool) Option {
 type PodController struct {
 	mu sync.RWMutex
 
-	mitmConnected   bool
-	onMitmConnected func(connected bool)
-	onMitmRequest   func(command FrankenCommand, payload string)
+	mitmConnected bool
+	killMitmLoop  func()
 
+	onMitmConnected    func(connected bool)
+	onMitmRequest      func(command FrankenCommand, payload string)
+	onFrankenConnected func(connected bool)
+	onVariables        func(pv *PodVariables)
+
+	connMutex   sync.RWMutex
 	conn        net.Conn
-	connected   bool
 	mitmMode    bool
 	connectedCh chan struct{}
 
 	// reconnectCh is a length-1 buffered channel used to signal a transition
 	// from connected -> disconnected.
 	reconnectCh chan struct{}
-
-	// configuration
-	readTimeout  time.Duration
-	varCallbacks []VariablesCallback
 
 	// last parsed variables
 	lastVariablesRaw string
@@ -219,7 +204,6 @@ type PodController struct {
 // New creates a PodController with provided options.
 func New(opts ...Option) *PodController {
 	p := &PodController{
-		readTimeout: DefaultSocketReadTimeout,
 		connectedCh: make(chan struct{}),
 		reconnectCh: make(chan struct{}),
 	}
@@ -245,9 +229,16 @@ func (p *PodController) SetMitmMode(enabled bool) {
 
 	p.mu.Lock()
 	p.mitmMode = enabled
+	kill := p.killMitmLoop
 	p.mu.Unlock()
 
-	p.setConnection(nil)
+	if enabled {
+		if kill == nil {
+			go p.runMitmLoop()
+		}
+	} else if kill != nil {
+		kill()
+	}
 }
 
 func (p *PodController) SetOnMitmConnected(f func(connected bool)) {
@@ -262,24 +253,54 @@ func (p *PodController) SetOnMitmRequest(f func(command FrankenCommand, payload 
 	p.onMitmRequest = f
 }
 
-func (p *PodController) WaitForConn() <-chan struct{} {
+func (p *PodController) SetOnFrankenConnected(f func(connected bool)) {
 	p.mu.RLock()
-	ch := p.connectedCh
+	p.onFrankenConnected = f
 	p.mu.RUnlock()
+	p.connMutex.RLock()
+	connected := p.conn != nil
+	p.connMutex.RUnlock()
+	f(connected)
+}
+
+func (p *PodController) SetOnVariables(f func(pv *PodVariables)) {
+	p.mu.RLock()
+	p.onVariables = f
+	p.mu.RUnlock()
+	if p.lastParsed != nil {
+		f(p.lastParsed)
+	}
+}
+
+func (p *PodController) WaitForConn() <-chan struct{} {
+	p.connMutex.RLock()
+	ch := p.connectedCh
+	p.connMutex.RUnlock()
 
 	return ch
 }
 
 // setConnection sets (and replaces) the active connection.
 func (p *PodController) setConnection(c net.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	var connected bool
+	defer func() {
+		p.mu.RLock()
+		f := p.onFrankenConnected
+		p.mu.RUnlock()
+
+		if f != nil {
+			go f(connected)
+		}
+	}()
+
+	p.connMutex.Lock()
+	defer p.connMutex.Unlock()
 	if p.conn != nil {
 		_ = p.conn.Close()
 	}
 	p.conn = c
-	p.connected = c != nil
-	if p.connected {
+	connected = p.conn != nil
+	if connected {
 		close(p.connectedCh)
 
 		log.Printf("[controller] new connection from %s", c.RemoteAddr().String())
@@ -298,11 +319,10 @@ func (p *PodController) setConnection(c net.Conn) {
 // waitForFranken waits for an inbound connection on the provided listener, sets it,
 // and returns the net.Conn (mirrors TS FrankenServer.waitForFranken).
 func (p *PodController) waitForFranken() (net.Conn, error) {
-	p.mu.RLock()
-	connected := p.connected
+	p.connMutex.RLock()
 	conn := p.conn
-	p.mu.RUnlock()
-	if connected && conn != nil {
+	p.connMutex.RUnlock()
+	if conn != nil {
 		return conn, nil
 	}
 
@@ -333,49 +353,48 @@ func (p *PodController) waitForFranken() (net.Conn, error) {
 
 // ConnAlive reports whether there is an active connection.
 func (p *PodController) ConnAlive() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.connected && p.conn != nil
+	p.connMutex.RLock()
+	defer p.connMutex.RUnlock()
+	return p.conn != nil
 }
 
 // ExecuteFranken issues a FrankenCommand with an optional hex payload.
-func (p *PodController) ExecuteFranken(cmd FrankenCommand, payloadHex string) (string, error) {
-	return p.ExecuteRaw(cmd.CommandID(), payloadHex)
+func (p *PodController) ExecuteFranken(ctx context.Context, cmd FrankenCommand, payloadHex string) (string, error) {
+	return p.ExecuteRaw(ctx, cmd.CommandID(), payloadHex)
 }
 
 // ExecuteRaw sends a raw command with optional hex payload and returns the response.
 // If the command is PLEASE_SEND_VARIABLES the variables are parsed, cached, and
 // callbacks are invoked (callbacks are executed after the lock is released).
-func (p *PodController) ExecuteRaw(commandID int, payloadHex string) (string, error) {
-	resp, parsed, callbacks, err := p.executeLocked(commandID, payloadHex)
+func (p *PodController) ExecuteRaw(ctx context.Context, commandID int, payloadHex string) (string, error) {
+	resp, err := p.executeLocked(ctx, commandID, payloadHex)
 	if err != nil {
+		p.setConnection(nil)
 		return "", err
 	}
-	if parsed != nil {
-		for _, cb := range callbacks {
-			cb(parsed)
-		}
+	if commandID == int(FrankenCommandPleaseSendVariables) && p.onVariables != nil && p.lastParsed != nil {
+		p.onVariables(p.lastParsed)
 	}
 	return resp, nil
 }
 
-func (p *PodController) ExecuteHeatLevel(side Side, level int) error {
-	_, err := p.ExecuteRaw(int(FrankenCommandLevelLeft)+int(side), strconv.Itoa(level))
+func (p *PodController) ExecuteHeatLevel(ctx context.Context, side Side, level int) error {
+	_, err := p.ExecuteRaw(ctx, int(FrankenCommandLevelLeft)+int(side), strconv.Itoa(level))
 	return err
 }
 
-func (p *PodController) ExecuteHeatDuration(side Side, duration int) error {
-	_, err := p.ExecuteRaw(int(FrankenCommandHeatLeft)+int(side), strconv.Itoa(duration))
+func (p *PodController) ExecuteHeatDuration(ctx context.Context, side Side, duration int) error {
+	_, err := p.ExecuteRaw(ctx, int(FrankenCommandHeatLeft)+int(side), strconv.Itoa(duration))
 	return err
 }
 
-func (p *PodController) ExecutePrime() error {
-	_, err := p.ExecuteRaw(int(FrankenCommandPrime), "")
+func (p *PodController) ExecutePrime(ctx context.Context) error {
+	_, err := p.ExecuteRaw(ctx, int(FrankenCommandPrime), "")
 	return err
 }
 
 // ExecuteAlarm builds and sends an alarm command for a side.
-func (p *PodController) ExecuteAlarm(a AlarmInput) (string, error) {
+func (p *PodController) ExecuteAlarm(ctx context.Context, a AlarmInput) (string, error) {
 	data := map[string]any{
 		"pl": uint8(a.PL),
 		"du": uint16(a.DU),
@@ -386,11 +405,11 @@ func (p *PodController) ExecuteAlarm(a AlarmInput) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return p.ExecuteRaw(int(FrankenCommandAlarmLeft)+int(a.Side), payloadHex)
+	return p.ExecuteRaw(ctx, int(FrankenCommandAlarmLeft)+int(a.Side), payloadHex)
 }
 
 // ExecuteSettings sends a settings command (currently LED brightness only).
-func (p *PodController) ExecuteSettings(s SettingsInput) (string, error) {
+func (p *PodController) ExecuteSettings(ctx context.Context, s SettingsInput) (string, error) {
 	data := map[string]any{
 		"lb": uint8(s.LB),
 	}
@@ -398,7 +417,12 @@ func (p *PodController) ExecuteSettings(s SettingsInput) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return p.ExecuteRaw(int(FrankenCommandSetSettings), payloadHex)
+	return p.ExecuteRaw(ctx, int(FrankenCommandSetSettings), payloadHex)
+}
+
+func (p *PodController) ExecuteVariables(ctx context.Context) error {
+	_, err := p.ExecuteRaw(ctx, int(FrankenCommandPleaseSendVariables), "")
+	return err
 }
 
 // ParsedVariables returns a deep copy of the last parsed variables (or nil).
@@ -427,14 +451,31 @@ func toCBORHex(v any) (string, error) {
 
 // executeLocked performs the core send/receive while holding the lock.
 // It returns: response string, parsed variables (if any), callbacks snapshot and error.
-func (p *PodController) executeLocked(commandID int, payloadHex string) (string, *PodVariables, []VariablesCallback, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (p *PodController) executeLocked(ctx context.Context, commandID int, payloadHex string) (string, error) {
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	p.connMutex.Lock()
+	defer p.connMutex.Unlock()
+
 	if p.conn == nil {
-		err := errors.New("no active connection")
 		log.Printf("[controller] execute command=%d error=no active connection", commandID)
-		return "", nil, nil, err
+		return "", errors.New("no active connection")
 	}
+
+	go func() {
+		<-cctx.Done()
+
+		if cctx.Err() != ctx.Err() {
+			// `executeLocked` has returned, do nothing
+			return
+		}
+
+		// canceled from outside, abort pending connections
+		p.conn.SetDeadline(time.Unix(1, 0))
+	}()
+
+	p.conn.SetDeadline(time.Time{})
 
 	var buf bytes.Buffer
 	if payloadHex != "" {
@@ -443,24 +484,19 @@ func (p *PodController) executeLocked(commandID int, payloadHex string) (string,
 		fmt.Fprintf(&buf, "%d\n\n", commandID)
 	}
 
-	_ = p.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	if _, err := p.conn.Write(buf.Bytes()); err != nil {
+	if _, err := buf.WriteTo(p.conn); err != nil {
 		log.Printf("[controller] write failed cmd=%d payload=%s err=%v", commandID, payloadHex, err)
-		return "", nil, nil, err
+		return "", err
 	}
 
-	_ = p.conn.SetReadDeadline(time.Now().Add(p.readTimeout))
 	readBuf := make([]byte, 8192)
-	n, rerr := p.conn.Read(readBuf)
+	n, err := p.conn.Read(readBuf)
 	var resp string
-	if rerr != nil {
-		if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+	if err != nil {
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
 			resp = ""
-		} else if errors.Is(rerr, io.EOF) {
-			resp = ""
-			p.setConnection(nil)
 		} else {
-			resp = ""
+			return "", err
 		}
 	} else {
 		resp = string(readBuf[:n])
@@ -470,13 +506,12 @@ func (p *PodController) executeLocked(commandID int, payloadHex string) (string,
 		parsed := parseVariables(resp)
 		p.lastVariablesRaw = resp
 		p.lastParsed = parsed
-		callbacks := append([]VariablesCallback(nil), p.varCallbacks...)
-		return resp, parsed, callbacks, nil
+		return resp, nil
 	} else {
-		log.Printf("[controller] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(rerr))
+		log.Printf("[controller] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(err))
 	}
 
-	return resp, nil, nil, nil
+	return resp, nil
 }
 
 // parseVariables converts raw key=value lines into a PodVariables structure.
@@ -590,9 +625,6 @@ func (p *PodController) RunUnixSocketLoop(ctx context.Context) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
-	var mu sync.Mutex
-	var killMitmLoop func()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -621,31 +653,16 @@ func (p *PodController) RunUnixSocketLoop(ctx context.Context) error {
 		mitm := p.mitmMode
 		p.mu.RUnlock()
 
-		mu.Lock()
-		kill := killMitmLoop
-		mu.Unlock()
-
 		if mitm {
-			if kill == nil {
-				go func() {
-					cctx, cancel := context.WithCancel(ctx)
-					defer cancel()
+			go p.runMitmLoop()
+		} else {
+			p.mu.RLock()
+			kill := p.killMitmLoop
+			p.mu.RUnlock()
 
-					mu.Lock()
-					killMitmLoop = cancel
-					mu.Unlock()
-
-					defer func() {
-						mu.Lock()
-						killMitmLoop = nil
-						mu.Unlock()
-					}()
-
-					p.runMitmLoop(cctx)
-				}()
+			if kill != nil {
+				kill()
 			}
-		} else if kill != nil {
-			kill()
 		}
 
 		if err := exec.Command("systemctl", "start", "dac").Run(); err != nil {
@@ -658,11 +675,21 @@ func (p *PodController) RunUnixSocketLoop(ctx context.Context) error {
 // forwards commands bi‑directionally between the first‑party process and the
 // active firmware connection managed by this controller.
 func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	upConn, err := net.Dial("unix", DacSocketPath)
 	if err != nil {
 		return fmt.Errorf("dial upstream: %w", err)
 	}
 	defer upConn.Close()
+
+	go func() {
+		<-cctx.Done()
+		upConn.SetDeadline(time.Unix(1, 0))
+	}()
+
+	upConn.SetDeadline(time.Time{})
 
 	{
 		p.mu.Lock()
@@ -696,30 +723,20 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 		default:
 		}
 
-		_ = upConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		cmdLine, err := reader.ReadString('\n')
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return fmt.Errorf("read command line: %w", err)
 		}
-		cmdLine = strings.TrimSpace(cmdLine)
-		if cmdLine == "" {
-			// Skip stray blank lines.
-			continue
-		}
+
 		commandID, err := strconv.Atoi(cmdLine)
 		if err != nil {
-			// Malformed line; log and continue.
-			log.Printf("[mitm] invalid command id line=%q", cmdLine)
+			slog.Warn("[mitm] invalid command id", "line", cmdLine)
 			continue
 		}
 
-		_ = upConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		payloadLine, err := reader.ReadString('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -727,13 +744,11 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 			}
 			return fmt.Errorf("read payload line: %w", err)
 		}
-		payloadLineTrimmed := strings.TrimSpace(payloadLine)
 
 		payloadHex := ""
-		if payloadLineTrimmed != "" {
-			payloadHex = payloadLineTrimmed
+		if payloadLine != "" {
+			payloadHex = payloadLine
 			// Consume the required terminating blank line if present (ignore errors/timeouts).
-			_ = upConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 			if term, terr := reader.ReadString('\n'); terr == nil {
 				_ = term
 			}
@@ -742,20 +757,18 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 			// nothing more to consume.
 		}
 
-		resp, execErr := p.ExecuteRaw(commandID, payloadHex)
+		resp, err := p.ExecuteRaw(ctx, commandID, payloadHex)
+		if err != nil {
+			return err
+		}
 
-		// Write response back (best effort).
-		_ = upConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		if resp == "" {
-			// Maintain protocol expectation of something being sent; at least a newline.
-			_, _ = upConn.Write([]byte("\n"))
-		} else {
-			_, _ = upConn.Write([]byte(resp))
+		if _, err := upConn.Write([]byte(resp)); err != nil {
+			slog.Warn("[mitm] write response", "err", err)
 		}
 
 		// Log the MITM interaction.
 		if commandID != int(FrankenCommandPleaseSendVariables) {
-			log.Printf("[mitm] cmd=%d payload=%s resp_len=%d err=%s", commandID, payloadHex, len(resp), errorString(execErr))
+			slog.Info("[mitm] cmd", "cmd", commandID, "payload", payloadHex, "resp_len", len(resp))
 		}
 
 		if p.onMitmRequest != nil {
@@ -764,12 +777,37 @@ func (p *PodController) mitmConnectAndForward(ctx context.Context) error {
 	}
 }
 
-func (p *PodController) runMitmLoop(ctx context.Context) {
+func (p *PodController) runMitmLoop() {
+	p.mu.RLock()
+	kill := p.killMitmLoop
+	p.mu.RUnlock()
+	if kill != nil {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p.mu.Lock()
+	p.killMitmLoop = cancel
+	p.mu.Unlock()
+
+	defer func() {
+		p.mu.Lock()
+		p.killMitmLoop = nil
+		p.mu.Unlock()
+	}()
+
 	for {
 		if err := p.mitmConnectAndForward(ctx); err != nil {
 			if ctx.Err() != nil {
 				log.Printf("[mitm-loop] context canceled, stopping")
 				return
+			}
+
+			if err == errNoFranken {
+				<-p.WaitForConn()
+				continue
 			}
 
 			log.Printf("[mitm-loop] error: %v", err)
