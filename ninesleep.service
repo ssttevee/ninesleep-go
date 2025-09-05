@@ -8,4 +8,4 @@ WantedBy=multi-user.target
 [Service]
 Type=simple
 Restart=always
-ExecStart=/home/dac/ninesleep
+ExecStart=/home/dac/ninesleep -mitm
