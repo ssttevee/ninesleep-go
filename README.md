@@ -4,6 +4,15 @@ This project started out as a rewrite of https://github.com/bobobo1618/ninesleep
 
 While the original project was a simple replacement for the "device api client" (or dac) server, I've come up with a way to maintain original app functionality while adding deeper local-only Home Assistant integration (with some [caveats](#Caveats)).
 
+After finishing this project, I found that there is also https://github.com/throwaway31265/free-sleep, which seems to have worked out compatibility with other pod revisions.
+Even crazier, https://github.com/LiamSnow/opensleep additionally replaces `frankenfirmware` AND `capybara`.
+
+This is probably as far as I will take this project personally, since I don't plan on buying new pods.
+I think this is a good middle-ground between stock and control-freak without being too invasive.
+And even if I tried to integrate the improvements from free-sleep, I wouldn't be able to test it.
+
+Feel free to take the web-based [rootfs patcher](jailbreak.html) to lower the bar for people jailbreak their pods. (That might be my only real innovation here lol...)
+
 ## Compatibility
 
 Only the Pod 3 has been tested. I only have one bed.
@@ -57,7 +66,10 @@ The sd card slot opens by sliding in, away from the edge of the pcb, and flippin
 
 ### "Jailbreaking"
 
-These are instructions for linux, but mac is almost the same. I can't be bothered to figure out how to do this on windows. I might make a web tool to make it easier though.
+These are instructions for linux, but mac is almost the same.
+I can't be bothered to figure out how to do this on windows.
+
+I also made a [browser tool](https://ssttevee.com/projects/ninesleep-go/jailbreak.html) that automatically handles step 2-10 for you, even on windows.
 
 0. (Optional, but highly recommended) Save an backup image of your sd card in case you screw it up.
 
@@ -254,3 +266,27 @@ And finally there are some higher level abstraction entities:
 - `climate_left` - simulates a thermostat with a "real" temperature value in celcius
 - `climate_right` - simulates a thermostat with a "real" temperature value in celcius
 - `climate_temperature_offset` - offset value for the "real" temperature, doesn't really work (disabled by default)
+
+## Development Notes
+
+- The pod's default ssh port is `8822`
+- The dac is written in js, you can pull the code from the sd card from `/home/dac/app`
+- gosthome is somewhat incomplete, many of the entity actions aren't hooked up
+- I'm almost certain that there are more settings for controlling the LED, but mine seemed to stop changing colours...
+
+### Maintaining app functionality/graceful failure
+
+The `dac` service binds to `/deviceinfo/dac.sock` and wait for `frankenfirmware` to connect (seems to attempt every 30 seconds or so), for controlling the device.
+I assume that it was designed like this to guarantee only a single process connected at any time, but you can just not `accept()` so I don't really know.
+
+When `ninesleep` wants to connect to `frankenfirmware` (i.e. on launch and when it looses connection homehow?), it temporary stops the `dac` service using `systemctl`.
+Then it binds to `/deviceinfo/dac.sock`, pretending to be `dac`.
+When `frankenfirmware` is connected, unbind from `/deviceinfo/dac.sock`.
+This does not kill file descriptor, so the connection remains alive.
+Then restart `dac` and let it bind to `/deviceinfo/dac.sock` like normal.
+Nothing will happen at this point because `frankenfirmware` is still connected.
+If `ninesleep` crashes, `frankenfirmware` will try to reconnect to `dac` like normal.
+
+The other part of this is that `ninesleep` can also pretend to be `frankenfirmware` and connect to `/deviceinfo/dac.sock`, then proxy the requests.
+This is otherwise known as a mitm, or man in the middle, proxy.
+In this mode, the app will be none the wiser and work as nothing is different.
